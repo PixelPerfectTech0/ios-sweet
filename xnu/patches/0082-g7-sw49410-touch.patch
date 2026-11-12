@@ -1,0 +1,597 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,4 +111,5 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_g7touch.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,5 +53,6 @@
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_g7touch_init(void);
+ 
+ #define REG_CAP         0x00
+@@ -660,4 +661,5 @@
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_g7touch_init();
+ 	return 0;
+ }
+--- /dev/null
++++ b/bsd/dev/sweet_g7touch.c
+@@ -0,0 +1,572 @@
++/*
++ * LG G7 ThinQ (judyln, SDM845): SiliconWorks SW49410 in-cell touch over SPI.
++ *
++ * Bus: QUPv3 wrap0 SE5 (spi5, 0x00894000), CS0, mode 0, 8-bit words, FIFO
++ * mode, polled. Pins: TLMM gpio85-88 = qup5 (EAST tile), gpio31 = touch
++ * IRQ (input, active low), gpio32 = touch reset (active low) (NORTH tile).
++ * Protocol (from the sdm845-mainline sw49410-ts-spi driver):
++ *   read  addr: tx 0x20|(addr>>8&0xf), addr&0xff, 4 dummy; data at rx+6
++ *   write addr: tx 0x40|(addr>>8&0xf), addr&0xff, data...
++ *   init: eight raw 6-byte writes, 100 ms apart
++ *   report: 132 bytes from 0x200 = 12-byte header + 10 x 12-byte contacts
++ * The SW49410 is a TDDI (it also drives the panel), so the reset pulse is
++ * off by default (g7touch_reset=1 enables it): it might blank the display.
++ *
++ * Boot-args: g7touch=0 disables, g7touchdelay=N seconds (default 30),
++ * g7touch_reset=1, g7touch_init=0 skips the init writes, g7touch_div=N SPI
++ * clock divider override.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_g7touch_init(void);
++
++#define G7_SE_PA        0x00894000u     /* QUPv3 wrap0 SE5 */
++#define G7_GCC_PA       0x00100000u
++#define G7_NORTH_PA     0x03900000u     /* TLMM 0x3400000 + NORTH 0x500000 */
++#define G7_EAST_PA      0x03500000u     /* TLMM 0x3400000 + EAST 0x100000 */
++#define G7_GCC_VOTE     0x5200cu        /* APCS_CLOCK_BRANCH_ENA_VOTE_1 */
++#define G7_RCG          0x17624u        /* gcc_qupv3_wrap0_s5_clk_src */
++#define G7_GPIO_CFG(n)  ((uint32_t)(n) * 0x1000u)
++#define G7_GPIO_IO(n)   (G7_GPIO_CFG(n) + 4u)
++#define G7_IRQ_GPIO     31u
++#define G7_RST_GPIO     32u
++#define G7_MAX          10u
++#define G7_PANEL_W      1440
++#define G7_PANEL_H      3120
++/* Panel -> SweetHID coordinates: the 1125x2436 iPhone X image is centred on
++ * the panel (157, 342), and SweetHID adds (22, 18) for its 1080x2400 base. */
++#define G7_HID_DX       (157 + 22)
++#define G7_HID_DY       (342 + 18)
++
++/* GENI */
++#define SE_FORCE_DEFAULT 0x020u
++#define SE_OUTPUT_CTRL  0x024u
++#define SE_CGC_CTRL     0x028u
++#define SE_STATUS       0x040u
++#define SE_M_CLK_CFG    0x048u
++#define SE_IF_DISABLE   0x064u
++#define SE_FW_REV       0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_SPI_CPHA     0x224u
++#define SE_SPI_LOOPBACK 0x22cu
++#define SE_SPI_CPOL     0x230u
++#define SE_SPI_DEMUX_INV 0x24cu
++#define SE_SPI_DEMUX_SEL 0x250u
++#define SE_BYTE_GRAN    0x254u
++#define SE_DMA_MODE_EN  0x258u
++#define SE_SPI_TRANS_CFG 0x25cu
++#define SE_TX_PACK0     0x260u
++#define SE_TX_PACK1     0x264u
++#define SE_SPI_WORD_LEN 0x268u
++#define SE_SPI_TX_LEN   0x26cu
++#define SE_SPI_RX_LEN   0x270u
++#define SE_RX_PACK0     0x284u
++#define SE_RX_PACK1     0x288u
++#define SE_M_CMD0       0x600u
++#define SE_M_CMD_CTRL   0x604u
++#define SE_M_IRQ        0x610u
++#define SE_M_IRQ_EN     0x614u
++#define SE_M_IRQ_CLR    0x618u
++#define SE_S_IRQ_EN     0x644u
++#define SE_S_IRQ_CLR    0x648u
++#define SE_TX_FIFO      0x700u
++#define SE_RX_FIFO      0x780u
++#define SE_TX_STATUS    0x800u
++#define SE_RX_STATUS    0x804u
++#define SE_TX_WM        0x80cu
++#define SE_RX_WM        0x810u
++#define SE_RX_RFR_WM    0x814u
++#define SE_GSI_EVENT_EN 0xe18u
++#define SE_IRQ_EN       0xe1cu
++#define SE_HW_PARAM0    0xe24u
++#define SE_HW_PARAM1    0xe28u
++#define SE_DMA_GEN_CFG  0xe30u
++
++#define M_CMD_DONE      (1u << 0)
++#define M_CMD_ABORT     (1u << 5)
++#define M_ERRORS        ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 24) | \
++                         (1u << 25) | (1u << 28) | (1u << 29))
++#define SPI_FULL_DUPLEX 3u              /* SPI_TX_ONLY | SPI_RX_ONLY */
++
++#define G7_XFER_MAX     160u
++
++static struct {
++	vm_offset_t se, gcc, north, east;
++	bool started, dead;
++	unsigned txdepth;
++	uint32_t active, irq;
++	int x[G7_MAX], y[G7_MAX];
++	uint8_t tx[G7_XFER_MAX], rx[G7_XFER_MAX];
++} g7;
++static int g7_sleep_chan;
++
++static uint32_t
++g7_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++g7_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++g7_sleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&g7_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++g7_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(g7_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* TLMM config: pull 0 none / 1 down / 3 up, drive = (mA / 2) - 1. */
++static void
++g7_gpio(vm_offset_t tile, unsigned pin, unsigned func, unsigned pull,
++    unsigned drive, bool out, bool high)
++{
++	uint32_t cfg = g7_rd(tile, G7_GPIO_CFG(pin));
++	if (out) {
++		uint32_t io = g7_rd(tile, G7_GPIO_IO(pin));
++		g7_wr(tile, G7_GPIO_IO(pin), high ? (io | 2u) : (io & ~2u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= pull | (func << 2) | (drive << 6) | (out ? 0x200u : 0u);
++	g7_wr(tile, G7_GPIO_CFG(pin), cfg);
++}
++
++static void
++g7_gpio_set(vm_offset_t tile, unsigned pin, bool high)
++{
++	uint32_t io = g7_rd(tile, G7_GPIO_IO(pin));
++	g7_wr(tile, G7_GPIO_IO(pin), high ? (io | 2u) : (io & ~2u));
++}
++
++/* Returns the SPI clock divider for a <= ~5 MHz bus, or 0 on failure. */
++static unsigned
++g7_clocks(void)
++{
++	/* wrap0 m_ahb (6), s_ahb (7), core (8), core_2x (9), s5 (15). */
++	uint32_t mask = (0x0fu << 6) | (1u << 15);
++	g7_wr(g7.gcc, G7_GCC_VOTE, g7_rd(g7.gcc, G7_GCC_VOTE) | mask);
++	uint32_t dfs = g7_rd(g7.gcc, G7_RCG + 0x14u);
++	uint32_t cfg = g7_rd(g7.gcc, G7_RCG + 4u);
++	unsigned div = 4; /* 19.2 MHz XO / 4 = 4.8 MHz */
++	printf("G7 TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    g7_rd(g7.gcc, G7_GCC_VOTE), g7_rd(g7.gcc, G7_RCG), cfg, dfs);
++	if (dfs & 1u) {
++		/* SE CLK_SEL=0 selects DFS level 0; tables are left alone. */
++		uint32_t l0 = g7_rd(g7.gcc, G7_RCG + 0x1cu);
++		printf("G7 TOUCH: DFS level0 cfg=%#x\n", l0);
++		if ((l0 & 0x371fu) != 1u) {
++			div = 24; /* unknown level-0 rate (<= 128 MHz): stay slow */
++		}
++	} else {
++		/* XO parent 0, divider 1 => 19.2 MHz. */
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++		g7_wr(g7.gcc, G7_RCG + 4u, cfg);
++		g7_wr(g7.gcc, G7_RCG, g7_rd(g7.gcc, G7_RCG) | 1u);
++		if (!g7_wait_clear(g7.gcc, G7_RCG, 1u)) {
++			printf("G7 TOUCH: RCG update timeout\n");
++			return 0;
++		}
++	}
++	const uint32_t branches[] = {0x17004, 0x17008, 0x17620};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (!g7_wait_clear(g7.gcc, branches[i], 1u << 31)) {
++			printf("G7 TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
++			    g7_rd(g7.gcc, branches[i]));
++			return 0;
++		}
++	}
++	return div;
++}
++
++static bool
++g7_se_init(unsigned div)
++{
++	uint32_t fw = g7_rd(g7.se, SE_FW_REV);
++	uint32_t p0 = g7_rd(g7.se, SE_HW_PARAM0), p1 = g7_rd(g7.se, SE_HW_PARAM1);
++	printf("G7 TOUCH: se5 fw=%#x proto=%u ifdis=%#x status=%#x hw0=%#x hw1=%#x\n",
++	    fw, (fw >> 8) & 0xffu, g7_rd(g7.se, SE_IF_DISABLE),
++	    g7_rd(g7.se, SE_STATUS), p0, p1);
++	if (((fw >> 8) & 0xffu) != 1u || (g7_rd(g7.se, SE_IF_DISABLE) & 1u) ||
++	    ((p0 >> 24) & 0x3fu) != 32u || ((p1 >> 24) & 0x3fu) != 32u ||
++	    ((p0 >> 16) & 0x3fu) < 4u) {
++		printf("G7 TOUCH: SE5 is not a FIFO SPI engine; stopping\n");
++		return false;
++	}
++	g7.txdepth = (p0 >> 16) & 0x3fu;
++	unsigned rxdepth = (p1 >> 16) & 0x3fu;
++	if (g7_rd(g7.se, SE_STATUS) & 1u) {
++		printf("G7 TOUCH: SE5 busy; stopping\n");
++		return false;
++	}
++	/* geni_se_init / io_init / select_fifo_mode */
++	g7_wr(g7.se, SE_GSI_EVENT_EN, 0);
++	g7_wr(g7.se, SE_M_IRQ_CLR, 0xffffffffu);
++	g7_wr(g7.se, SE_S_IRQ_CLR, 0xffffffffu);
++	g7_wr(g7.se, SE_IRQ_EN, 0);      /* polled: nothing routed to the GIC */
++	g7_wr(g7.se, SE_CGC_CTRL, g7_rd(g7.se, SE_CGC_CTRL) | 0x7fu);
++	g7_wr(g7.se, SE_DMA_GEN_CFG, g7_rd(g7.se, SE_DMA_GEN_CFG) | 0x0fu);
++	g7_wr(g7.se, SE_OUTPUT_CTRL, 0x7f);
++	g7_wr(g7.se, SE_FORCE_DEFAULT, 1);
++	g7_wr(g7.se, SE_DMA_MODE_EN, 0);
++	g7_wr(g7.se, SE_RX_WM, rxdepth - 3u);
++	g7_wr(g7.se, SE_RX_RFR_WM, rxdepth - 2u);
++	g7_wr(g7.se, SE_TX_WM, 0);
++	g7_wr(g7.se, SE_S_IRQ_EN, 0);
++	g7_wr(g7.se, SE_M_IRQ_EN, M_CMD_DONE | M_CMD_ABORT | M_ERRORS |
++	    (1u << 26) | (1u << 27) | (1u << 30));
++	/* 8-bit words, four per FIFO word, LSB byte first. */
++	g7_wr(g7.se, SE_TX_PACK0, 0x0004380eu);
++	g7_wr(g7.se, SE_TX_PACK1, 0x000c3e0eu);
++	g7_wr(g7.se, SE_RX_PACK0, 0x0004380eu);
++	g7_wr(g7.se, SE_RX_PACK1, 0x000c3e0eu);
++	g7_wr(g7.se, SE_BYTE_GRAN, 0);
++	g7_wr(g7.se, SE_SPI_WORD_LEN, 8u - 4u);
++	g7_wr(g7.se, SE_SPI_TRANS_CFG, g7_rd(g7.se, SE_SPI_TRANS_CFG) & ~2u);
++	g7_wr(g7.se, SE_SPI_LOOPBACK, 0);
++	g7_wr(g7.se, SE_SPI_DEMUX_SEL, 0);
++	g7_wr(g7.se, SE_SPI_CPHA, 0);
++	g7_wr(g7.se, SE_SPI_CPOL, 0);
++	g7_wr(g7.se, SE_SPI_DEMUX_INV, 0);
++	g7_wr(g7.se, SE_CLK_SEL, 0);
++	g7_wr(g7.se, SE_M_CLK_CFG, (div << 4) | 1u);
++	if ((g7_rd(g7.se, SE_TX_STATUS) & 0xfffffffu) ||
++	    (g7_rd(g7.se, SE_RX_STATUS) & 0x1ffffffu)) {
++		printf("G7 TOUCH: inherited FIFO data; stopping\n");
++		return false;
++	}
++	printf("G7 TOUCH: SPI ready, div %u, txdepth %u rxdepth %u\n", div,
++	    g7.txdepth, rxdepth);
++	return true;
++}
++
++static void
++g7_abort(void)
++{
++	g7_wr(g7.se, SE_M_CMD_CTRL, 2u);
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (g7_rd(g7.se, SE_M_IRQ) & M_CMD_ABORT) {
++			break;
++		}
++		delay(1);
++	}
++	for (unsigned i = 0; i < 64 && (g7_rd(g7.se, SE_RX_STATUS) & 0x1ffffffu); ++i) {
++		(void)g7_rd(g7.se, SE_RX_FIFO);
++	}
++	g7_wr(g7.se, SE_M_IRQ_CLR, 0xffffffffu);
++	if (!g7_wait_clear(g7.se, SE_STATUS, 1u)) {
++		g7.dead = true;
++		printf("G7 TOUCH: abort failed; stopping\n");
++	}
++}
++
++/* One full-duplex transfer of len bytes with CS asserted throughout. */
++static int
++g7_spi(unsigned len)
++{
++	if (g7.dead || len == 0 || len > G7_XFER_MAX) {
++		return EIO;
++	}
++	if (!g7_wait_clear(g7.se, SE_STATUS, 1u)) {
++		g7.dead = true;
++		return EBUSY;
++	}
++	g7_wr(g7.se, SE_M_IRQ_CLR, 0xffffffffu);
++	g7_wr(g7.se, SE_SPI_TX_LEN, len);
++	g7_wr(g7.se, SE_SPI_RX_LEN, len);
++	g7_wr(g7.se, SE_M_CMD0, SPI_FULL_DUPLEX << 27);
++	unsigned sent = 0, got = 0;
++	for (unsigned i = 0; i < 50000; ++i) {
++		uint32_t irq = g7_rd(g7.se, SE_M_IRQ);
++		g7.irq = irq;
++		if (irq & M_ERRORS) {
++			break;
++		}
++		uint32_t txc = g7_rd(g7.se, SE_TX_STATUS) & 0xfffffffu;
++		while (sent < len && txc < g7.txdepth) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < 4 && sent + j < len; ++j) {
++				word |= (uint32_t)g7.tx[sent + j] << (8u * j);
++			}
++			g7_wr(g7.se, SE_TX_FIFO, word);
++			sent += 4;
++			txc++;
++		}
++		uint32_t wc = g7_rd(g7.se, SE_RX_STATUS) & 0x1ffffffu;
++		while (wc--) {
++			uint32_t word = g7_rd(g7.se, SE_RX_FIFO);
++			for (unsigned j = 0; j < 4 && got < len; ++j) {
++				g7.rx[got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		if ((irq & M_CMD_DONE) && got >= len) {
++			g7_wr(g7.se, SE_M_IRQ_CLR, irq);
++			return 0;
++		}
++		if (irq & M_CMD_DONE) {
++			/* DONE before the last RX words were drained: next pass. */
++			if (!(g7_rd(g7.se, SE_RX_STATUS) & 0x1ffffffu)) {
++				break;
++			}
++			continue;
++		}
++		g7_wr(g7.se, SE_M_IRQ_CLR, irq & ((1u << 26) | (1u << 27) | (1u << 30)));
++		delay(1);
++	}
++	g7_abort();
++	return EIO;
++}
++
++static int
++g7_reg_read(uint16_t addr, unsigned size)
++{
++	if (size + 6u > G7_XFER_MAX) {
++		return EINVAL;
++	}
++	bzero(g7.tx, size + 6u);
++	g7.tx[0] = (uint8_t)(0x20u | ((addr >> 8) & 0x0fu));
++	g7.tx[1] = (uint8_t)addr;
++	return g7_spi(size + 6u); /* data at g7.rx + 6 */
++}
++
++static uint16_t
++g7_le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
++}
++
++static void
++g7_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned id = 0; id < G7_MAX; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(g7.active & bit) || x[id] != g7.x[id] || y[id] != g7.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			g7.x[id] = x[id];
++			g7.y[id] = y[id];
++		} else if (g7.active & bit) {
++			sweet_hid_touch((int)id, 0, g7.x[id], g7.y[id]);
++		}
++	}
++	g7.active = mask;
++}
++
++static int
++g7_clamp(int v, int lo, int hi)
++{
++	return v < lo ? lo : (v > hi ? hi : v);
++}
++
++/* Read one report; returns 0 and updates contacts, or an error. */
++static int
++g7_poll(unsigned *frames)
++{
++	int err = g7_reg_read(0x200, 132);
++	if (err) {
++		return err;
++	}
++	const uint8_t *b = g7.rx + 6;
++	uint32_t mask = g7.active;
++	int x[G7_MAX], y[G7_MAX];
++	for (unsigned i = 0; i < G7_MAX; ++i) {
++		x[i] = g7.x[i];
++		y[i] = g7.y[i];
++	}
++	for (unsigned i = 0; i < G7_MAX; ++i) {
++		const uint8_t *p = b + 12u + 12u * i;
++		unsigned event = p[0] >> 4;
++		if (event == 1u || event == 2u) {
++			unsigned px = g7_le16(p + 2), py = g7_le16(p + 4);
++			if (px >= G7_PANEL_W || py >= G7_PANEL_H) {
++				return ERANGE;
++			}
++			x[i] = g7_clamp((int)px - G7_HID_DX, -22, 1125 - 22 - 1);
++			y[i] = g7_clamp((int)py - G7_HID_DY, -18, 2436 - 18 - 1);
++			mask |= 1u << i;
++		} else if (event == 3u) {
++			mask &= ~(1u << i);
++		}
++	}
++	if (mask != g7.active || mask) {
++		++*frames;
++	}
++	g7_report(mask, x, y);
++	return 0;
++}
++
++static void
++g7_dump(const char *what)
++{
++	const uint8_t *b = g7.rx;
++	printf("G7 TOUCH: %s %02x%02x%02x%02x%02x%02x | %02x%02x%02x%02x %02x%02x%02x%02x "
++	    "%02x%02x%02x%02x | %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n", what,
++	    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11],
++	    b[12], b[13], b[14], b[15], b[16], b[17], b[18], b[19], b[20], b[21],
++	    b[22], b[23], b[24], b[25], b[26], b[27], b[28], b[29]);
++}
++
++static const uint8_t g7_init_seq[8][6] = {
++	{0x6f, 0xe4, 0x01, 0x00, 0x00, 0x00},
++	{0x6f, 0xe5, 0x00, 0x00, 0x00, 0x00},
++	{0x6f, 0xf3, 0x03, 0x00, 0x00, 0x00},
++	{0x6f, 0xf3, 0x03, 0x00, 0x00, 0x00},
++	{0x6f, 0xf3, 0x03, 0x00, 0x00, 0x00},
++	{0x6c, 0x00, 0x01, 0x00, 0x00, 0x00},
++	{0x6c, 0x01, 0x01, 0x00, 0x00, 0x00},
++	{0x6c, 0x03, 0x85, 0x01, 0x00, 0x00},
++};
++
++static void
++g7_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 30, do_reset = 0, do_init = 1, div_arg = 0;
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("g7touchdelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("g7touch_reset", &do_reset, sizeof(do_reset));
++	(void)PE_parse_boot_argn("g7touch_init", &do_init, sizeof(do_init));
++	(void)PE_parse_boot_argn("g7touch_div", &div_arg, sizeof(div_arg));
++	printf("G7 TOUCH: SW49410 driver, starting in %u s (reset=%u init=%u)\n",
++	    delay_s, do_reset, do_init);
++	g7_sleep(delay_s * 1000u);
++	g7.gcc = ml_io_map(G7_GCC_PA, 0x60000);
++	g7.north = ml_io_map(G7_NORTH_PA, 0x21000);
++	g7.east = ml_io_map(G7_EAST_PA, 0x59000);
++	g7.se = ml_io_map(G7_SE_PA, 0x4000);
++	if (!g7.gcc || !g7.north || !g7.east || !g7.se) {
++		printf("G7 TOUCH: MMIO mapping failed\n");
++		goto out;
++	}
++	printf("G7 TOUCH: gpio31 cfg=%#x io=%#x gpio32 cfg=%#x io=%#x gpio85 cfg=%#x\n",
++	    g7_rd(g7.north, G7_GPIO_CFG(31)), g7_rd(g7.north, G7_GPIO_IO(31)),
++	    g7_rd(g7.north, G7_GPIO_CFG(32)), g7_rd(g7.north, G7_GPIO_IO(32)),
++	    g7_rd(g7.east, G7_GPIO_CFG(85)));
++	unsigned div = g7_clocks();
++	if (!div) {
++		goto out;
++	}
++	if (div_arg) {
++		div = div_arg;
++	}
++	/* SPI pins: qup5 (function 1), 6 mA, no pull. */
++	for (unsigned pin = 85; pin <= 88; ++pin) {
++		g7_gpio(g7.east, pin, 1, 0, 2, false, false);
++	}
++	g7_gpio(g7.north, G7_IRQ_GPIO, 0, 3, 0, false, false); /* input, pull-up */
++	if (!g7_se_init(div)) {
++		goto out;
++	}
++	if (do_reset) {
++		g7_gpio(g7.north, G7_RST_GPIO, 0, 0, 0, true, true);
++		g7_sleep(90);
++		g7_gpio_set(g7.north, G7_RST_GPIO, false);
++		g7_sleep(90);
++		g7_gpio_set(g7.north, G7_RST_GPIO, true);
++		g7_sleep(90);
++		printf("G7 TOUCH: reset pulsed\n");
++	}
++	int err = g7_reg_read(0x200, 132);
++	printf("G7 TOUCH: first read err=%d irq=%#x\n", err, g7.irq);
++	if (!err) {
++		g7_dump("pre-init");
++	}
++	if (do_init) {
++		for (unsigned i = 0; i < 8 && !g7.dead; ++i) {
++			bcopy(g7_init_seq[i], g7.tx, 6);
++			err = g7_spi(6);
++			if (err) {
++				printf("G7 TOUCH: init %u err=%d irq=%#x\n", i, err, g7.irq);
++			}
++			g7_sleep(100);
++		}
++		printf("G7 TOUCH: init sequence sent\n");
++	}
++	unsigned errors = 0, frames = 0, ticks = 0, shown = 0;
++	while (!g7.dead) {
++		err = g7_poll(&frames);
++		if (err) {
++			if ((errors++ % 200u) == 0) {
++				printf("G7 TOUCH: report err=%d irq=%#x\n", err, g7.irq);
++			}
++			if (errors == 20) {
++				g7_report(0, g7.x, g7.y);
++			}
++		} else {
++			errors = 0;
++			if (shown < 3 && (g7.rx[6 + 9] & 0x1fu)) {
++				g7_dump("touch");
++				shown++;
++			}
++		}
++		if (++ticks == 300) {
++			/* every ~5 s for the first while: proof of life */
++			printf("G7 TOUCH: alive, frames=%u active=%#x gpio31=%u\n", frames,
++			    g7.active, g7_rd(g7.north, G7_GPIO_IO(G7_IRQ_GPIO)) & 1u);
++			if (!err && frames == 0) {
++				g7_dump("idle");
++			}
++			ticks = frames > 0 ? 301 : 0;
++		}
++		g7_sleep(15);
++	}
++	g7_report(0, g7.x, g7.y);
++out:
++	printf("G7 TOUCH: stopped\n");
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_g7touch_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if (g7.started) {
++		return;
++	}
++	g7.started = true;
++	(void)PE_parse_boot_argn("g7touch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("G7 TOUCH: disabled (g7touch=0)\n");
++		return;
++	}
++	if (kernel_thread_start(g7_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("G7 TOUCH: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
