@@ -22,7 +22,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_g7touch.c
-@@ -0,0 +1,815 @@
+@@ -0,0 +1,858 @@
 +/*
 + * LG G7 ThinQ (judyln, SDM845): SiliconWorks SW49410 in-cell touch over SPI.
 + *
@@ -518,7 +518,8 @@
 +		return EINVAL;
 +	}
 +	bzero(g7.tx, size + 6u);
-+	g7.tx[0] = (uint8_t)(0x20u | ((addr >> 8) & 0x0fu));
++	/* LG touch_sw49410.c: 0x20 for bursts, 0x00 for <= 4 bytes */
++	g7.tx[0] = (uint8_t)((size > 4u ? 0x20u : 0x00u) | ((addr >> 8) & 0x0fu));
 +	g7.tx[1] = (uint8_t)addr;
 +	return g7_spi(size + 6u); /* data at g7.rx + 6 */
 +}
@@ -760,7 +761,49 @@
 +		    (kind == 1 ? "all 00" : "all ff"));
 +		g7_stage(5, kind == 0 ? G7_GREEN : (kind == 1 ? G7_YELLOW : G7_RED));
 +	}
-+	if (do_init) {
++	{
++		/* tc_version (0x312) and product id (0x314): proof the chip answers */
++		uint32_t ver = 0;
++		if (g7_reg_read(0x312, 4) == 0) {
++			ver = (uint32_t)g7.rx[6] | ((uint32_t)g7.rx[7] << 8) |
++			    ((uint32_t)g7.rx[8] << 16) | ((uint32_t)g7.rx[9] << 24);
++		}
++		char pid[9];
++		bzero(pid, sizeof(pid));
++		if (g7_reg_read(0x314, 8) == 0) {
++			for (unsigned i = 0; i < 8; ++i) {
++				uint8_t c = g7.rx[6 + i];
++				pid[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
++			}
++		}
++		printf("G7 TOUCH: fw version %#x product '%s'\n", ver, pid);
++	}
++	if (do_init == 1) {
++		/*
++		 * LG touch_sw49410.c init (SPI writes: 0x40|addr hi, addr lo, LE32):
++		 * SPI_OSC_CTL=7, SPI_CLK_CTL=1 (touch clock on), tc_device_ctl=1,
++		 * tc_interrupt_ctl=1, tc_driving_ctl=0x181 (LCD mode U3, normal).
++		 */
++		static const uint32_t seq[5][2] = {
++			{0xFE1, 0x07}, {0xFE2, 0x01}, {0xC00, 0x01}, {0xC01, 0x01}, {0xC03, 0x181},
++		};
++		unsigned bad = 0;
++		for (unsigned i = 0; i < 5 && !g7.dead; ++i) {
++			uint32_t a = seq[i][0], v = seq[i][1];
++			g7.tx[0] = (uint8_t)(0x40u | ((a >> 8) & 0x0fu));
++			g7.tx[1] = (uint8_t)a;
++			g7.tx[2] = (uint8_t)v;
++			g7.tx[3] = (uint8_t)(v >> 8);
++			g7.tx[4] = (uint8_t)(v >> 16);
++			g7.tx[5] = (uint8_t)(v >> 24);
++			if (g7_spi(6)) {
++				bad++;
++			}
++			g7_sleep(i == 4 ? 30 : 10);
++		}
++		printf("G7 TOUCH: LG init sent (%u errors)\n", bad);
++		g7_stage(6, bad ? G7_RED : G7_GREEN);
++	} else if (do_init == 2) {
 +		unsigned bad = 0;
 +		for (unsigned i = 0; i < 8 && !g7.dead; ++i) {
 +			bcopy(g7_init_seq[i], g7.tx, 6);
