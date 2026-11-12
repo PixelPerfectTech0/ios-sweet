@@ -8,7 +8,7 @@
  bsd/dev/munge.c 			optional config_requires_u32_munging
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -53,5 +53,6 @@
+@@ -53,4 +53,5 @@
  extern void sweet_touch_init(void);
  extern void sweet_usb_probe(void);
 +extern void sweet_g7touch_init(void);
