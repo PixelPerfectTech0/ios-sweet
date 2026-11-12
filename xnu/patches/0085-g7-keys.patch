@@ -61,7 +61,7 @@
  	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
  	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
  	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
-@@ -166,9 +177,26 @@ sweet_keys_init(void)
+@@ -166,9 +177,25 @@ sweet_keys_init(void)
  	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
  	    mode & 3u : (mode >> 4) & 7u;
  	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
@@ -82,8 +82,7 @@
 +		*(volatile uint32_t *)keys_ai = cfg;
 +		__asm__ volatile("dsb osh" ::: "memory");
 +		delay(100);
-+		printf("SWEET KEYS: G7 assistant key gpio89 cfg=%#x in=%u (reported as Home)
-+",
++		printf("SWEET KEYS: G7 assistant key gpio89 cfg=%#x in=%u (reported as Home)\n",
 +		    keys_rd(keys_ai, 0), keys_rd(keys_ai, 4) & 1u);
 +	}
  	if (!pok && !gok) {
