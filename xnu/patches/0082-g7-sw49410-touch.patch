@@ -22,7 +22,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_g7touch.c
-@@ -0,0 +1,728 @@
+@@ -0,0 +1,815 @@
 +/*
 + * LG G7 ThinQ (judyln, SDM845): SiliconWorks SW49410 in-cell touch over SPI.
 + *
@@ -64,6 +64,10 @@
 +#define G7_RCG          0x17624u        /* gcc_qupv3_wrap0_s5_clk_src */
 +#define G7_GPIO_CFG(n)  ((uint32_t)(n) * 0x1000u)
 +#define G7_GPIO_IO(n)   (G7_GPIO_CFG(n) + 4u)
++#define G7_BB_MISO      85u     /* QUP SE5 pin order: MISO, MOSI, CLK, CS */
++#define G7_BB_MOSI      86u
++#define G7_BB_CLK       87u
++#define G7_BB_CS        88u
 +#define G7_IRQ_GPIO     31u
 +#define G7_RST_GPIO     32u
 +#define G7_MAX          10u
@@ -148,6 +152,7 @@
 +static struct {
 +	vm_offset_t se, gcc, north, east;
 +	bool started, dead;
++	bool bb, cpol;          /* bit-banged SPI, SPI mode 3 */
 +	unsigned txdepth;
 +	uint32_t active, irq;
 +	int x[G7_MAX], y[G7_MAX];
@@ -406,12 +411,55 @@
 +	}
 +}
 +
++/*
++ * Bit-banged SPI, MSB first, sampled on the rising clock edge (mode 0, or
++ * mode 3 with g7.cpol). Each TLMM access is a few hundred ns, so the clock
++ * stays around 1 MHz, well under the SW49410's limit.
++ */
++static void
++g7_bb_pin(unsigned pin, bool high)
++{
++	g7_wr(g7.east, G7_GPIO_IO(pin), high ? 2u : 0u);
++}
++
++static int
++g7_spi_bb(unsigned len)
++{
++	g7_bb_pin(G7_BB_CLK, g7.cpol);
++	g7_bb_pin(G7_BB_CS, false);
++	delay(2);
++	for (unsigned i = 0; i < len; ++i) {
++		uint8_t out = g7.tx[i], in = 0;
++		for (int b = 7; b >= 0; --b) {
++			if (g7.cpol) {
++				g7_bb_pin(G7_BB_CLK, false);
++			}
++			g7_bb_pin(G7_BB_MOSI, (out >> b) & 1u);
++			(void)g7_rd(g7.east, G7_GPIO_IO(G7_BB_MOSI));   /* settle */
++			g7_bb_pin(G7_BB_CLK, true);
++			(void)g7_rd(g7.east, G7_GPIO_IO(G7_BB_CLK));
++			in = (uint8_t)((in << 1) | (g7_rd(g7.east, G7_GPIO_IO(G7_BB_MISO)) & 1u));
++			if (!g7.cpol) {
++				g7_bb_pin(G7_BB_CLK, false);
++			}
++		}
++		g7.rx[i] = in;
++	}
++	delay(2);
++	g7_bb_pin(G7_BB_CS, true);
++	delay(5);
++	return 0;
++}
++
 +/* One full-duplex transfer of len bytes with CS asserted throughout. */
 +static int
 +g7_spi(unsigned len)
 +{
 +	if (g7.dead || len == 0 || len > G7_XFER_MAX) {
 +		return EIO;
++	}
++	if (g7.bb) {
++		return g7_spi_bb(len);
 +	}
 +	if (!g7_wait_clear(g7.se, SE_STATUS, 1u)) {
 +		g7.dead = true;
@@ -632,16 +680,47 @@
 +	if (div_arg) {
 +		div = div_arg;
 +	}
-+	/* SPI pins: qup5 (function 1), 6 mA, no pull. */
-+	for (unsigned pin = 85; pin <= 88; ++pin) {
-+		g7_gpio(g7.east, pin, 1, 0, 2, false, false);
-+	}
++	/*
++	 * On the G7 the SE5 firmware runs in GSI (GPI DMA) mode: IF_DISABLE has
++	 * FIFO_IF_DISABLE set and the M_CMD/FIFO registers are not ours. Then
++	 * (or with g7touch_bb=1) drive the four SPI pins as plain GPIOs.
++	 */
++	unsigned bb = (g7_rd(g7.se, SE_IF_DISABLE) & 1u) ? 1u : 0u;
++	(void)PE_parse_boot_argn("g7touch_bb", &bb, sizeof(bb));
 +	g7_gpio(g7.north, G7_IRQ_GPIO, 0, 3, 0, false, false); /* input, pull-up */
-+	if (!g7_se_init(div)) {
-+		g7_stage(3, G7_RED);
-+		goto out;
++	if (bb) {
++		g7.bb = true;
++		/* gpio85 MISO in (pull-up), 86 MOSI, 87 CLK, 88 CS out; 4 mA. */
++		g7_gpio(g7.east, G7_BB_MISO, 0, 3, 1, false, false);
++		g7_gpio(g7.east, G7_BB_MOSI, 0, 0, 1, true, false);
++		g7_gpio(g7.east, G7_BB_CLK, 0, 0, 1, true, false);
++		g7_gpio(g7.east, G7_BB_CS, 0, 0, 1, true, true);
++		printf("G7 TOUCH: SE5 in GSI mode; bit-banged SPI on gpio85-88\n");
++		g7_stage(3, G7_GREEN);
++	} else {
++		/* SPI pins: qup5 (function 1), 6 mA, no pull. */
++		for (unsigned pin = 85; pin <= 88; ++pin) {
++			g7_gpio(g7.east, pin, 1, 0, 2, false, false);
++		}
++		if (!g7_se_init(div)) {
++			g7_stage(3, G7_RED);
++			goto out;
++		}
++		g7_stage(3, G7_GREEN);
 +	}
-+	g7_stage(3, G7_GREEN);
++	/*
++	 * gpio32 (touch reset, active low) is left as a pulled-down input by
++	 * the bootloader, which may hold the touch side in reset. Release it
++	 * (drive high, no low pulse) unless g7touch_release=0.
++	 */
++	unsigned release = 1;
++	(void)PE_parse_boot_argn("g7touch_release", &release, sizeof(release));
++	if (release && !do_reset) {
++		unsigned was = g7_rd(g7.north, G7_GPIO_IO(G7_RST_GPIO)) & 1u;
++		g7_gpio(g7.north, G7_RST_GPIO, 0, 0, 0, true, true);
++		g7_sleep(300);
++		printf("G7 TOUCH: reset line released (was %u)\n", was);
++	}
 +	if (do_reset) {
 +		g7_gpio(g7.north, G7_RST_GPIO, 0, 0, 0, true, true);
 +		g7_sleep(90);
@@ -659,11 +738,19 @@
 +		unsigned kind = g7_rx_kind();
 +		if (kind == 2) {
 +			/* Only FFs (nothing drives MISO): try SPI mode 3 as well. */
-+			g7_wr(g7.se, SE_SPI_CPHA, 1);
-+			g7_wr(g7.se, SE_SPI_CPOL, 1);
++			if (g7.bb) {
++				g7.cpol = true;
++				g7_wr(g7.east, G7_GPIO_IO(G7_BB_CLK), 2u);
++			} else {
++				g7_wr(g7.se, SE_SPI_CPHA, 1);
++				g7_wr(g7.se, SE_SPI_CPOL, 1);
++			}
 +			if (g7_reg_read(0x200, 132) == 0 && g7_rx_kind() == 0) {
 +				printf("G7 TOUCH: chip answers in SPI mode 3\n");
 +				kind = 0;
++			} else if (g7.bb) {
++				g7.cpol = false;
++				g7_wr(g7.east, G7_GPIO_IO(G7_BB_CLK), 0u);
 +			} else {
 +				g7_wr(g7.se, SE_SPI_CPHA, 0);
 +				g7_wr(g7.se, SE_SPI_CPOL, 0);
