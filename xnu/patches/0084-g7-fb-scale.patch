@@ -1,6 +1,14 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -104,6 +104,9 @@ public:
+@@ -37,6 +37,7 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" void sweet_g7touch_overlay(uintptr_t pixels, uint32_t stride, uint32_t w, uint32_t h);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -104,6 +105,9 @@ public:
  	uint32_t      fWidth, fHeight, fRowBytes;
  	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
  	int32_t       fOffX, fOffY;             /* logical origin of the panel */
@@ -10,7 +18,7 @@
  	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
  	IOMemoryMap  *fMap;
  	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
-@@ -177,6 +180,24 @@ AppleCLCD::start(IOService *provider)
+@@ -177,6 +181,24 @@ AppleCLCD::start(IOService *provider)
  	}
  	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
  	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
@@ -35,7 +43,7 @@
  	fLock = IOLockAlloc();
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -202,8 +223,9 @@ AppleCLCD::start(IOService *provider)
+@@ -202,8 +224,9 @@ AppleCLCD::start(IOService *provider)
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
  	registerService();
@@ -47,7 +55,7 @@
  	return true;
  }
  
-@@ -379,11 +401,14 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -379,11 +402,14 @@ AppleCLCD::present(const uint8_t *rec)
  		if (h > (int32_t)s->height - sy) {
  			h = (int32_t)s->height - sy;
  		}
@@ -66,7 +74,7 @@
  		}
  		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
  		    (uint64_t)(sx + w) * 4;
-@@ -391,7 +416,34 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -391,7 +417,34 @@ AppleCLCD::present(const uint8_t *rec)
  		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
@@ -102,3 +110,11 @@
  			for (int32_t y = 0; y < h; y++) {
  				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
  				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+@@ -400,6 +453,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	sweet_g7touch_overlay(fPixels, fRowBytes, fWidth, fHeight);
+ }
+ 
+ bool

@@ -22,7 +22,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_g7touch.c
-@@ -0,0 +1,709 @@
+@@ -0,0 +1,728 @@
 +/*
 + * LG G7 ThinQ (judyln, SDM845): SiliconWorks SW49410 in-cell touch over SPI.
 + *
@@ -78,14 +78,15 @@
 +#define G7_HID_OY       18
 +
 +/*
-+ * Status strip: 8 coloured blocks across the top 16 panel rows, redrawn on
-+ * every poll so they stay visible over the GUI (boot-arg g7touch_bar=0 hides
-+ * it). Blocks: 1 started, 2 clocks, 3 SPI engine, 4 first SPI read,
++ * Status strip: 8 coloured blocks, 120 rows tall at panel row 2200, drawn
++ * by the poll loop and again after every frame by AppleCLCD::present() so
++ * they stay visible over the GUI (boot-arg g7touch_bar=0 hides it). Blocks: 1 started, 2 clocks, 3 SPI engine, 4 first SPI read,
 + * 5 chip answers, 6 init writes, 7 polling, 8 touch seen (flips blue/green
 + * on every touch). Grey = not reached, green = OK, red = failed,
 + * yellow = suspicious (chip returned only zeros).
 + */
-+#define G7_BAR_ROWS     16u
++#define G7_BAR_ROWS     120u
++#define G7_BAR_Y        2200u   /* panel row: the empty middle of the lock screen */
 +#define G7_GREY         0xff606060u
 +#define G7_GREEN        0xff00c000u
 +#define G7_RED          0xffe00000u
@@ -173,28 +174,46 @@
 +	}
 +	bzero(&v, sizeof(v));
 +	PE_current_console(&v);
-+	if (v.v_baseAddr == 0 || v.v_width < 64 || v.v_rowBytes < v.v_width * 4) {
++	if (v.v_baseAddr == 0 || v.v_width < 64 || v.v_rowBytes < v.v_width * 4 ||
++	    v.v_height < G7_BAR_Y + G7_BAR_ROWS) {
 +		return;
 +	}
-+	g7.bar = ml_io_map((vm_offset_t)v.v_baseAddr, (vm_size_t)v.v_rowBytes * G7_BAR_ROWS);
++	g7.bar = ml_io_map((vm_offset_t)v.v_baseAddr + (vm_offset_t)v.v_rowBytes * G7_BAR_Y,
++	    (vm_size_t)v.v_rowBytes * G7_BAR_ROWS);
 +	g7.bar_w = (uint32_t)v.v_width;
 +	g7.bar_stride = (uint32_t)v.v_rowBytes;
++}
++
++/* rows: G7_BAR_ROWS rows starting at the strip's first row */
++static void
++g7_bar_paint(uintptr_t rows, uint32_t stride, uint32_t w)
++{
++	uint32_t block = w / 8u;
++	for (uint32_t y = 0; y < G7_BAR_ROWS; ++y) {
++		volatile uint32_t *row = (volatile uint32_t *)(rows + (uintptr_t)y * stride);
++		for (uint32_t x = 0; x < w; ++x) {
++			uint32_t i = x / block;
++			/* 12-pixel black gap between blocks */
++			row[x] = (i >= 8u || (x % block) >= block - 12u) ? 0xff000000u : g7.stage[i];
++		}
++	}
 +}
 +
 +static void
 +g7_bar_draw(void)
 +{
-+	if (!g7.bar) {
-+		return;
++	if (g7.bar) {
++		g7_bar_paint(g7.bar, g7.bar_stride, g7.bar_w);
 +	}
-+	uint32_t block = g7.bar_w / 8u;
-+	for (uint32_t y = 0; y < G7_BAR_ROWS; ++y) {
-+		volatile uint32_t *row = (volatile uint32_t *)(g7.bar + (vm_offset_t)y * g7.bar_stride);
-+		for (uint32_t x = 0; x < g7.bar_w; ++x) {
-+			uint32_t i = x / block;
-+			/* 4-pixel black gap between blocks */
-+			row[x] = (i >= 8u || (x % block) >= block - 4u) ? 0xff000000u : g7.stage[i];
-+		}
++}
++
++/* Called by AppleCLCD::present() after each frame so the strip stays on top. */
++void sweet_g7touch_overlay(uintptr_t pixels, uint32_t stride, uint32_t w, uint32_t h);
++void
++sweet_g7touch_overlay(uintptr_t pixels, uint32_t stride, uint32_t w, uint32_t h)
++{
++	if (g7.bar && pixels && h >= G7_BAR_Y + G7_BAR_ROWS && w == g7.bar_w) {
++		g7_bar_paint(pixels + (uintptr_t)G7_BAR_Y * stride, stride, w);
 +	}
 +}
 +
