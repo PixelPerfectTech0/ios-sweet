@@ -22,7 +22,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_g7touch.c
-@@ -0,0 +1,572 @@
+@@ -0,0 +1,709 @@
 +/*
 + * LG G7 ThinQ (judyln, SDM845): SiliconWorks SW49410 in-cell touch over SPI.
 + *
@@ -69,10 +69,28 @@
 +#define G7_MAX          10u
 +#define G7_PANEL_W      1440
 +#define G7_PANEL_H      3120
-+/* Panel -> SweetHID coordinates: the 1125x2436 iPhone X image is centred on
-+ * the panel (157, 342), and SweetHID adds (22, 18) for its 1080x2400 base. */
-+#define G7_HID_DX       (157 + 22)
-+#define G7_HID_DY       (342 + 18)
++/* Panel -> SweetHID coordinates. The 1125x2436 iPhone X image is stretched
++ * over the whole panel (SweetFramebuffer, sweetfb_scale=1, the default) or
++ * centred on it at (157, 342); SweetHID adds (22, 18) for its 1080x2400 base. */
++#define G7_LOG_W        1125
++#define G7_LOG_H        2436
++#define G7_HID_OX       22
++#define G7_HID_OY       18
++
++/*
++ * Status strip: 8 coloured blocks across the top 16 panel rows, redrawn on
++ * every poll so they stay visible over the GUI (boot-arg g7touch_bar=0 hides
++ * it). Blocks: 1 started, 2 clocks, 3 SPI engine, 4 first SPI read,
++ * 5 chip answers, 6 init writes, 7 polling, 8 touch seen (flips blue/green
++ * on every touch). Grey = not reached, green = OK, red = failed,
++ * yellow = suspicious (chip returned only zeros).
++ */
++#define G7_BAR_ROWS     16u
++#define G7_GREY         0xff606060u
++#define G7_GREEN        0xff00c000u
++#define G7_RED          0xffe00000u
++#define G7_YELLOW       0xffe0e000u
++#define G7_BLUE         0xff0060ffu
 +
 +/* GENI */
 +#define SE_FORCE_DEFAULT 0x020u
@@ -133,8 +151,61 @@
 +	uint32_t active, irq;
 +	int x[G7_MAX], y[G7_MAX];
 +	uint8_t tx[G7_XFER_MAX], rx[G7_XFER_MAX];
++	bool scaled;
++	vm_offset_t bar;
++	uint32_t bar_w, bar_stride;
++	uint32_t stage[8];
++	unsigned touches;
 +} g7;
 +static int g7_sleep_chan;
++
++static void
++g7_bar_init(void)
++{
++	PE_Video v;
++	unsigned on = 1;
++	(void)PE_parse_boot_argn("g7touch_bar", &on, sizeof(on));
++	for (unsigned i = 0; i < 8; ++i) {
++		g7.stage[i] = G7_GREY;
++	}
++	if (!on) {
++		return;
++	}
++	bzero(&v, sizeof(v));
++	PE_current_console(&v);
++	if (v.v_baseAddr == 0 || v.v_width < 64 || v.v_rowBytes < v.v_width * 4) {
++		return;
++	}
++	g7.bar = ml_io_map((vm_offset_t)v.v_baseAddr, (vm_size_t)v.v_rowBytes * G7_BAR_ROWS);
++	g7.bar_w = (uint32_t)v.v_width;
++	g7.bar_stride = (uint32_t)v.v_rowBytes;
++}
++
++static void
++g7_bar_draw(void)
++{
++	if (!g7.bar) {
++		return;
++	}
++	uint32_t block = g7.bar_w / 8u;
++	for (uint32_t y = 0; y < G7_BAR_ROWS; ++y) {
++		volatile uint32_t *row = (volatile uint32_t *)(g7.bar + (vm_offset_t)y * g7.bar_stride);
++		for (uint32_t x = 0; x < g7.bar_w; ++x) {
++			uint32_t i = x / block;
++			/* 4-pixel black gap between blocks */
++			row[x] = (i >= 8u || (x % block) >= block - 4u) ? 0xff000000u : g7.stage[i];
++		}
++	}
++}
++
++static void
++g7_stage(unsigned i, uint32_t color)
++{
++	if (i >= 1 && i <= 8) {
++		g7.stage[i - 1] = color;
++	}
++	g7_bar_draw();
++}
 +
 +static uint32_t
 +g7_rd(vm_offset_t base, uint32_t off)
@@ -385,6 +456,19 @@
 +	return g7_spi(size + 6u); /* data at g7.rx + 6 */
 +}
 +
++/* After a 132-byte read: 0 = data varies, 1 = all 00, 2 = all ff, 3 = other constant. */
++static unsigned
++g7_rx_kind(void)
++{
++	const uint8_t *b = g7.rx + 6;
++	for (unsigned i = 1; i < 132u; ++i) {
++		if (b[i] != b[0]) {
++			return 0;
++		}
++	}
++	return b[0] == 0x00 ? 1u : (b[0] == 0xff ? 2u : 3u);
++}
++
 +static uint16_t
 +g7_le16(const uint8_t *p)
 +{
@@ -436,10 +520,22 @@
 +		if (event == 1u || event == 2u) {
 +			unsigned px = g7_le16(p + 2), py = g7_le16(p + 4);
 +			if (px >= G7_PANEL_W || py >= G7_PANEL_H) {
-+				return ERANGE;
++				continue;       /* garbage contact: ignore it, keep polling */
 +			}
-+			x[i] = g7_clamp((int)px - G7_HID_DX, -22, 1125 - 22 - 1);
-+			y[i] = g7_clamp((int)py - G7_HID_DY, -18, 2436 - 18 - 1);
++			int lx, ly;
++			if (g7.scaled) {
++				lx = (int)(px * G7_LOG_W / G7_PANEL_W);
++				ly = (int)(py * G7_LOG_H / G7_PANEL_H);
++			} else {
++				lx = (int)px - (G7_PANEL_W - G7_LOG_W) / 2;
++				ly = (int)py - (G7_PANEL_H - G7_LOG_H) / 2;
++			}
++			x[i] = g7_clamp(lx - G7_HID_OX, -G7_HID_OX, G7_LOG_W - G7_HID_OX - 1);
++			y[i] = g7_clamp(ly - G7_HID_OY, -G7_HID_OY, G7_LOG_H - G7_HID_OY - 1);
++			if (!(mask & (1u << i))) {
++				g7.touches++;
++				g7.stage[7] = (g7.touches & 1u) ? G7_GREEN : G7_BLUE;
++			}
 +			mask |= 1u << i;
 +		} else if (event == 3u) {
 +			mask &= ~(1u << i);
@@ -486,23 +582,34 @@
 +	(void)PE_parse_boot_argn("g7touch_div", &div_arg, sizeof(div_arg));
 +	printf("G7 TOUCH: SW49410 driver, starting in %u s (reset=%u init=%u)\n",
 +	    delay_s, do_reset, do_init);
++	{
++		unsigned sc = 1;
++		(void)PE_parse_boot_argn("sweetfb_scale", &sc, sizeof(sc));
++		g7.scaled = sc != 0;
++	}
 +	g7_sleep(delay_s * 1000u);
++	g7_bar_init();
++	g7_stage(1, G7_YELLOW);
 +	g7.gcc = ml_io_map(G7_GCC_PA, 0x60000);
 +	g7.north = ml_io_map(G7_NORTH_PA, 0x21000);
 +	g7.east = ml_io_map(G7_EAST_PA, 0x59000);
 +	g7.se = ml_io_map(G7_SE_PA, 0x4000);
 +	if (!g7.gcc || !g7.north || !g7.east || !g7.se) {
 +		printf("G7 TOUCH: MMIO mapping failed\n");
++		g7_stage(1, G7_RED);
 +		goto out;
 +	}
++	g7_stage(1, G7_GREEN);
 +	printf("G7 TOUCH: gpio31 cfg=%#x io=%#x gpio32 cfg=%#x io=%#x gpio85 cfg=%#x\n",
 +	    g7_rd(g7.north, G7_GPIO_CFG(31)), g7_rd(g7.north, G7_GPIO_IO(31)),
 +	    g7_rd(g7.north, G7_GPIO_CFG(32)), g7_rd(g7.north, G7_GPIO_IO(32)),
 +	    g7_rd(g7.east, G7_GPIO_CFG(85)));
 +	unsigned div = g7_clocks();
 +	if (!div) {
++		g7_stage(2, G7_RED);
 +		goto out;
 +	}
++	g7_stage(2, G7_GREEN);
 +	if (div_arg) {
 +		div = div_arg;
 +	}
@@ -512,8 +619,10 @@
 +	}
 +	g7_gpio(g7.north, G7_IRQ_GPIO, 0, 3, 0, false, false); /* input, pull-up */
 +	if (!g7_se_init(div)) {
++		g7_stage(3, G7_RED);
 +		goto out;
 +	}
++	g7_stage(3, G7_GREEN);
 +	if (do_reset) {
 +		g7_gpio(g7.north, G7_RST_GPIO, 0, 0, 0, true, true);
 +		g7_sleep(90);
@@ -525,23 +634,45 @@
 +	}
 +	int err = g7_reg_read(0x200, 132);
 +	printf("G7 TOUCH: first read err=%d irq=%#x\n", err, g7.irq);
++	g7_stage(4, err ? G7_RED : G7_GREEN);
 +	if (!err) {
 +		g7_dump("pre-init");
++		unsigned kind = g7_rx_kind();
++		if (kind == 2) {
++			/* Only FFs (nothing drives MISO): try SPI mode 3 as well. */
++			g7_wr(g7.se, SE_SPI_CPHA, 1);
++			g7_wr(g7.se, SE_SPI_CPOL, 1);
++			if (g7_reg_read(0x200, 132) == 0 && g7_rx_kind() == 0) {
++				printf("G7 TOUCH: chip answers in SPI mode 3\n");
++				kind = 0;
++			} else {
++				g7_wr(g7.se, SE_SPI_CPHA, 0);
++				g7_wr(g7.se, SE_SPI_CPOL, 0);
++			}
++		}
++		printf("G7 TOUCH: chip data %s\n", kind == 0 ? "varies" :
++		    (kind == 1 ? "all 00" : "all ff"));
++		g7_stage(5, kind == 0 ? G7_GREEN : (kind == 1 ? G7_YELLOW : G7_RED));
 +	}
 +	if (do_init) {
++		unsigned bad = 0;
 +		for (unsigned i = 0; i < 8 && !g7.dead; ++i) {
 +			bcopy(g7_init_seq[i], g7.tx, 6);
 +			err = g7_spi(6);
 +			if (err) {
++				bad++;
 +				printf("G7 TOUCH: init %u err=%d irq=%#x\n", i, err, g7.irq);
 +			}
 +			g7_sleep(100);
 +		}
 +		printf("G7 TOUCH: init sequence sent\n");
++		g7_stage(6, bad ? G7_RED : G7_GREEN);
 +	}
 +	unsigned errors = 0, frames = 0, ticks = 0, shown = 0;
 +	while (!g7.dead) {
 +		err = g7_poll(&frames);
++		g7.stage[6] = err ? G7_RED : G7_GREEN;
++		g7_bar_draw();
 +		if (err) {
 +			if ((errors++ % 200u) == 0) {
 +				printf("G7 TOUCH: report err=%d irq=%#x\n", err, g7.irq);
@@ -568,8 +699,14 @@
 +		g7_sleep(15);
 +	}
 +	g7_report(0, g7.x, g7.y);
++	g7_stage(7, G7_RED);
 +out:
 +	printf("G7 TOUCH: stopped\n");
++	/* Keep the strip visible after a failure so it can be photographed. */
++	for (unsigned i = 0; g7.bar && i < 4000u; ++i) {
++		g7_bar_draw();
++		g7_sleep(30);
++	}
 +	(void)thread_terminate(current_thread());
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
