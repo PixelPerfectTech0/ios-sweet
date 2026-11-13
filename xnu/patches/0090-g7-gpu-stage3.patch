@@ -779,7 +779,15 @@
   *
   * Offsets: Linux drivers/clk/qcom/gcc-sdm845.c and gpucc-sdm845.c
   * (register facts only). Bit layout: a branch control register (CBCR) has
-@@ -57,9 +66,129 @@ void g7_gpu_init(void);
+@@ -25,6 +34,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -57,9 +67,153 @@ void g7_gpu_init(void);
  #define G7G_GMU_AO_COUNTER_L        0x1f888u
  #define G7G_GMU_SPTPRAC_STATUS      0x1f8d0u
  
@@ -893,6 +901,24 @@
 +
 +#include "g7_sqe_fw.h"
 +
++/*
++ * Stage 7: zap shader (LG-signed, a630_zap.mbn) through TrustZone's PAS
++ * service, then CP_SET_SECURE_MODE 0. The image is not in this source: the
++ * boot payload carries it as /chosen/memory-map "G7Zap" = <phys, size>
++ * (mkpayload --blob G7Zap=a630_zap.mbn), inside the kernel's own reserved
++ * range. Load region and PAS id from the SDM845 / judyln device trees.
++ */
++#define G7G_ZAP_REGION_PA           0x8c415000u /* judyln gpu_mem, no-map, below the kernel's RAM */
++#define G7G_ZAP_REGION_SIZE         0x2000u
++#define G7G_GPU_PAS_ID              13u
++#define G7G_SCM_PAS_INIT_IMAGE      0x42000201u /* SMCCC std, SMC64, SiP, svc 2 cmd 1 */
++#define G7G_SCM_PAS_MEM_SETUP       0x42000202u
++#define G7G_SCM_PAS_AUTH_RESET      0x42000205u
++#define G7G_SCM_PAS_IS_SUPPORTED    0x42000207u
++#define G7G_PM4_SET_SECURE_MODE     0x66u
++#define G7G_MARKER2                 0x6630b00fu
++#define G7G_ELF_HASH_FLAGS(f)       (((f) & 0x07000000u) == 0x02000000u)
++
 +extern void *IOMallocContiguous(vm_size_t size, vm_size_t alignment, uint64_t *physicalAddress);
 +extern void CleanPoC_DcacheRegion(vm_offset_t va, size_t length);
 +extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
@@ -906,11 +932,17 @@
 +	uint32_t db_size;
 +	char smmu[160];
 +	char cp[160];
-+	bool gx_ok, smmu_bypass;
++	char zap[160];
++	bool gx_ok, smmu_bypass, cp_ok;
++	uint64_t zap_pa, zap_size;      /* from /chosen/memory-map G7Zap, read at init */
++	uint32_t *ring;                 /* stage 6 ring (kernel view), its write index and scratch */
++	uint32_t ring_w;
++	volatile uint32_t *scratch;
++	uint64_t scratch_pa;
  	unsigned level;
  	char summary[160];
  } g7g;
-@@ -86,6 +215,42 @@ g7g_gmu_rd(uint32_t dword)
+@@ -86,6 +240,42 @@ g7g_gmu_rd(uint32_t dword)
  	return g7g_rd(g7g.gmu, dword * 4u - (G7G_GMU_PA - G7G_GPU_PA));
  }
  
@@ -953,7 +985,7 @@
  static void
  g7g_sleep(unsigned ms)
  {
-@@ -119,6 +284,530 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
+@@ -119,6 +309,727 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
  	return false;
  }
  
@@ -1144,6 +1176,12 @@
 +	g7g_gpu_wr(G7G_SECVID_TSB_CNTL, 0);
 +	g7g_gpu_wr64(G7G_SECVID_TSB_TRUSTED_BASE, 0);
 +	g7g_gpu_wr(G7G_SECVID_TSB_TRUSTED_SIZE, 0);
++	/* 64-bit addressing in every block: our memory is above 4 GiB. */
++	static const uint32_t addr_mode[] = { 0x0842, 0x0c01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601,
++		                              0x0e00, 0xae01, 0xb601, 0xf810 };
++	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); i++) {
++		g7g_gpu_wr(addr_mode[i], 0x1);
++	}
 +	g7g_gpu_wr(G7G_RBBM_VBIF_QOS, 0x3);
 +	g7g_gpu_wr(G7G_VBIF_GATE_OFF_WRREQ_EN, 0x9);
 +	g7g_gpu_wr64(G7G_UCHE_WRITE_RANGE_MAX, 0x0001ffffffffffc0ull);
@@ -1204,6 +1242,197 @@
 +	    "stage6: COMMAND PROCESSOR RAN: marker %#x written by the GPU, rptr %u/%u, fault %#x" :
 +	    "stage6: CP did not write the marker (%#x), rptr %u/%u, rbbm %#x, fault %#x, cpint %#x",
 +	    seen, rptr, w, seen == G7G_MARKER ? fault : rbbm, seen == G7G_MARKER ? 0 : fault, cpint);
++	g7g.cp_ok = seen == G7G_MARKER;
++	g7g.ring = ring;
++	g7g.ring_w = w;
++	g7g.scratch = scratch;
++	g7g.scratch_pa = scratch_pa;
++}
++
++/* ---- Stage 7: zap shader through TrustZone ---- */
++
++struct g7g_smc_res {
++	uint64_t a0, a1, a2, a3;
++};
++
++/* One SMCCC call (x0..x6 in, x0..x3 out); the hypervisor forwards SiP calls to TrustZone. */
++static void
++g7g_smc(uint64_t fn, uint64_t arginfo, uint64_t a2, uint64_t a3, uint64_t a4, struct g7g_smc_res *r)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = arginfo;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	register uint64_t x4 __asm__("x4") = a4;
++	register uint64_t x5 __asm__("x5") = 0;
++	register uint64_t x6 __asm__("x6") = 0;
++	__asm__ volatile ("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
++	    : "r"(x4), "r"(x5), "r"(x6)
++	    : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	r->a0 = x0;
++	r->a1 = x1;
++	r->a2 = x2;
++	r->a3 = x3;
++}
++
++/*
++ * A Qualcomm SCM call: retried while TrustZone says "interrupted" (1, resume
++ * with x0 = 1) or "busy" (-12). Returns TrustZone's status (0 = ok); *result
++ * gets the first result word.
++ */
++static int64_t
++g7g_scm(uint32_t fn, uint32_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *result)
++{
++	struct g7g_smc_res r;
++	uint64_t x0 = fn;
++	for (int busy = 0; busy < 50; busy++) {
++		for (int i = 0; i < 1000; i++) {
++			g7g_smc(x0, arginfo, a, b, c, &r);
++			if (r.a0 != 1) {
++				break;
++			}
++			x0 = 1;
++		}
++		if ((int64_t)r.a0 != -12) {
++			break;
++		}
++		x0 = fn;
++		g7g_sleep(30);
++	}
++	if (result) {
++		*result = r.a1;
++	}
++	return (int64_t)r.a0;
++}
++
++/* Append a PM4 packet to the stage 6 ring and run it; true when rptr reaches the end. */
++static bool
++g7g_ring_run(const uint32_t *words, uint32_t n, uint32_t *rptr_out)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		g7g.ring[g7g.ring_w + i] = words[i];
++	}
++	CleanPoC_DcacheRegion((vm_offset_t)&g7g.ring[g7g.ring_w], n * 4u);
++	g7g.ring_w += n;
++	g7g_gpu_wr(G7G_CP_RB_WPTR, g7g.ring_w);
++	uint32_t rptr = 0;
++	for (int ms = 0; ms < 1000; ms++) {
++		delay(1000);
++		rptr = g7g_gpu_rd(G7G_CP_RB_RPTR);
++		if (rptr == g7g.ring_w) {
++			break;
++		}
++	}
++	if (rptr_out) {
++		*rptr_out = rptr;
++	}
++	return rptr == g7g.ring_w;
++}
++
++static void
++g7g_stage7(void)
++{
++	if (!g7g.zap_pa || g7g.zap_size < 0x100 || g7g.zap_size > 0x10000) {
++		snprintf(g7g.zap, sizeof(g7g.zap), "stage7: no zap image in the boot payload (G7Zap %#llx/%#llx)",
++		    (unsigned long long)g7g.zap_pa, (unsigned long long)g7g.zap_size);
++		return;
++	}
++	vm_offset_t img = ml_io_map((vm_offset_t)g7g.zap_pa, (vm_size_t)g7g.zap_size);
++	if (!img) {
++		snprintf(g7g.zap, sizeof(g7g.zap), "stage7: zap map failed");
++		return;
++	}
++	const uint8_t *b = (const uint8_t *)img;
++	uint32_t size = (uint32_t)g7g.zap_size;
++	/* ELF32: header, program headers, hash segment, one relocatable load segment. */
++	uint32_t phoff = 0, phnum = 0, phent = 0;
++	memcpy(&phoff, b + 0x1c, 4);
++	memcpy(&phent, b + 0x2a, 2);
++	memcpy(&phnum, b + 0x2c, 2);
++	if (memcmp(b, "\177ELF", 4) || b[4] != 1 || phent != 32 || phnum == 0 || phnum > 8 ||
++	    phoff + phnum * 32u > size) {
++		snprintf(g7g.zap, sizeof(g7g.zap), "stage7: zap image is not the expected ELF32");
++		return;
++	}
++	uint32_t hdr_len = phoff + phnum * 32u, hash_off = 0, hash_len = 0;
++	uint32_t load_off = 0, load_len = 0, load_mem = 0, load_pa = 0;
++	for (uint32_t i = 0; i < phnum; i++) {
++		uint32_t ph[8];
++		memcpy(ph, b + phoff + i * 32u, 32);    /* type off va pa filesz memsz flags align */
++		if (G7G_ELF_HASH_FLAGS(ph[6])) {
++			hash_off = ph[1];
++			hash_len = ph[4];
++		} else if (ph[0] == 1 && ph[5]) {
++			load_off = ph[1];
++			load_pa = ph[3];
++			load_len = ph[4];
++			load_mem = ph[5];
++		}
++	}
++	if (!hash_len || !load_mem || hash_off + hash_len > size || load_off + load_len > size ||
++	    load_mem > G7G_ZAP_REGION_SIZE) {
++		snprintf(g7g.zap, sizeof(g7g.zap), "stage7: zap layout unexpected (hash %#x+%#x load %#x+%#x/%#x)",
++		    hash_off, hash_len, load_off, load_len, load_mem);
++		return;
++	}
++
++	uint64_t supported = 0;
++	int64_t st = g7g_scm(G7G_SCM_PAS_IS_SUPPORTED, 1, G7G_GPU_PAS_ID, 0, 0, &supported);
++	printf("G7 GPU: stage7 PAS supported for GPU: status %lld result %llu\n", (long long)st,
++	    (unsigned long long)supported);
++
++	/* Metadata (ELF headers + hash) in contiguous memory TrustZone may lock while it checks it. */
++	uint64_t md_pa = 0;
++	uint8_t *md = IOMallocContiguous(0x4000, 0x1000, &md_pa);
++	if (!md || !md_pa) {
++		snprintf(g7g.zap, sizeof(g7g.zap), "stage7: metadata allocation failed");
++		return;
++	}
++	memcpy(md, b, hdr_len);
++	memcpy(md + hdr_len, b + hash_off, hash_len);
++	CleanPoC_DcacheRegion((vm_offset_t)md, 0x4000);
++	uint64_t res = 0;
++	int64_t s_init = g7g_scm(G7G_SCM_PAS_INIT_IMAGE, 0x82, G7G_GPU_PAS_ID, md_pa, 0, &res);
++	int64_t s_mem = -1, s_auth = -1;
++	if (s_init == 0) {
++		s_mem = g7g_scm(G7G_SCM_PAS_MEM_SETUP, 3, G7G_GPU_PAS_ID, G7G_ZAP_REGION_PA, load_mem, &res);
++	}
++	if (s_mem == 0) {
++		vm_offset_t region = ml_io_map(G7G_ZAP_REGION_PA, G7G_ZAP_REGION_SIZE);
++		if (region) {
++			/* One relocatable segment: it goes to the start of the region whatever its linked address. */
++			volatile uint8_t *dst = (volatile uint8_t *)region;
++			for (uint32_t i = 0; i < load_mem; i++) {
++				dst[i] = i < load_len ? b[load_off + i] : 0;
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++			s_auth = g7g_scm(G7G_SCM_PAS_AUTH_RESET, 1, G7G_GPU_PAS_ID, 0, 0, &res);
++		}
++	}
++	printf("G7 GPU: stage7 zap %u bytes (segment %#x at %#x): init %lld mem_setup %lld auth_and_reset %lld "
++	    "(result %#llx)\n", size, load_mem, load_pa, (long long)s_init, (long long)s_mem, (long long)s_auth,
++	    (unsigned long long)res);
++	if (s_auth != 0) {
++		snprintf(g7g.zap, sizeof(g7g.zap), "stage7: TrustZone refused the zap (init %lld, mem %lld, auth %lld)",
++		    (long long)s_init, (long long)s_mem, (long long)s_auth);
++		return;
++	}
++
++	/* Leave secure mode, then prove the CP still runs with a second marker. */
++	uint32_t pk[6] = {
++		g7g_pkt7(G7G_PM4_SET_SECURE_MODE, 1), 0,
++		g7g_pkt7(G7G_PM4_MEM_WRITE, 3), (uint32_t)g7g.scratch_pa, (uint32_t)(g7g.scratch_pa >> 32), G7G_MARKER2,
++	};
++	uint32_t rptr = 0;
++	bool ran = g7g_ring_run(pk, 6, &rptr);
++	FlushPoC_DcacheRegion((vm_offset_t)g7g.scratch, 64);
++	uint32_t seen = g7g.scratch[0];
++	snprintf(g7g.zap, sizeof(g7g.zap), seen == G7G_MARKER2 ?
++	    "stage7: ZAP ACCEPTED, GPU OUT OF SECURE MODE, marker %#x, rptr %u/%u" :
++	    "stage7: zap accepted, but the CP did not run the next packets (marker %#x, rptr %u/%u)",
++	    seen, rptr, g7g.ring_w);
++	(void)ran;
 +}
 +
 +/* ---- RPMh command DB (read only) ---- */
@@ -1484,7 +1713,7 @@
  /*
   * Stage 2: the GPU's bus clocks, the CX power domain and the GMU clocks
   * (GMU core clock from the 19.2 MHz crystal: slow but needs no PLL), then
-@@ -184,6 +873,21 @@ g7g_stage2(void)
+@@ -184,6 +1095,28 @@ g7g_stage2(void)
  	snprintf(g7g.summary, sizeof(g7g.summary),
  	    "stage2: CX on, GMU clocks on, GMU %s (counter %#x -> %#x), CM3 reset %#x",
  	    ao1 != ao2 ? "ALIVE" : "not counting", ao1, ao2, rst);
@@ -1503,10 +1732,17 @@
 +			g7g_stage6();
 +		}
 +	}
++	if (g7g.level >= 7) {
++		if (g7g.cp_ok) {
++			g7g_stage7();
++		} else {
++			snprintf(g7g.zap, sizeof(g7g.zap), "stage7: skipped (command processor not running)");
++		}
++	}
  }
  
  static void
-@@ -241,6 +945,12 @@ g7g_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -241,6 +1174,15 @@ g7g_thread(void *arg __unused, wait_result_t wr __unused)
  	}
  	for (int i = 0; i < 60; i++) {
  		printf("G7 GPU: %s\n", g7g.summary[0] ? g7g.summary : "no result");
@@ -1516,9 +1752,28 @@
 +		if (g7g.cp[0]) {
 +			printf("G7 GPU: %s\n", g7g.cp);
 +		}
++		if (g7g.zap[0]) {
++			printf("G7 GPU: %s\n", g7g.zap);
++		}
  		g7g_sleep(10000);
  	}
  	(void)thread_terminate(current_thread());
+@@ -254,6 +1196,15 @@ g7_gpu_init(void)
+ 	if (g7g.level == 0) {
+ 		return;
+ 	}
++	/* The zap image's place in the boot payload, while the device tree is still at hand. */
++	DTEntry mm;
++	void const *prop = NULL;
++	unsigned int psize = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) == kSuccess &&
++	    SecureDTGetProperty(mm, "G7Zap", &prop, &psize) == kSuccess && psize == 16) {
++		memcpy(&g7g.zap_pa, prop, 8);
++		memcpy(&g7g.zap_size, (const uint8_t *)prop + 8, 8);
++	}
+ 	if (kernel_thread_start(g7g_thread, NULL, &t) == KERN_SUCCESS) {
+ 		thread_deallocate(t);
+ 	}
 --- /dev/null
 +++ b/bsd/dev/g7_sqe_fw.h
 @@ -0,0 +1,1432 @@
