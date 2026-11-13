@@ -46,7 +46,7 @@ jobs:
 
       - name: Sources
         run: |
-          for r in "am $ADRENO_METAL_REPO $ADRENO_METAL_COMMIT" "ux $UNIXNU_REPO $UNIXNU_COMMIT" "pm4 https://github.com/UniXNU/AdrenoPM4 282606b528b2595bc4274ea7490b62b323f35a5f"; do
+          for r in "am $ADRENO_METAL_REPO $ADRENO_METAL_COMMIT" "ux $UNIXNU_REPO $UNIXNU_COMMIT" "pm4 https://github.com/UniXNU/AdrenoPM4 282606b528b2595bc4274ea7490b62b323f35a5f" "GopFramebuffer https://github.com/UniXNU/GopFramebuffer b0d812d578efa2acb005b66f73168891719af09a"; do
             set -- $r; git init -q $1; git -C $1 remote add origin $2; git -C $1 fetch -q --depth 1 origin $3; git -C $1 checkout -q FETCH_HEAD
           done
           git init -q mesa && git -C mesa remote add origin "$MESA_UPSTREAM"
