@@ -763,17 +763,20 @@
 +};
 --- a/bsd/dev/g7_gpu.c
 +++ b/bsd/dev/g7_gpu.c
-@@ -10,6 +10,9 @@
+@@ -10,6 +10,12 @@
   * the GMU clocks (from the crystal), then checks that the GMU answers.
   * (On the G7 the bootloader leaves all of it off; stage 1 found the AHB
   * clock on and everything else off.)
 + * Stage 3 (g7gpu=3): programs the GPU's RSC/PDC power sequencers, loads the
 + * GMU firmware (a630_gmu.bin) and starts the GMU's Cortex-M3, then reports
 + * whether the firmware signalled "init done".
++ * Stage 4 (g7gpu=4): reads the GPU rail levels from the RPMh command DB,
++ * asks the GMU to power the GPU core (GX) at SVS, and reads GPU core
++ * registers if (and only if) the GMU reports GX powered and clocked.
   *
   * Offsets: Linux drivers/clk/qcom/gcc-sdm845.c and gpucc-sdm845.c
   * (register facts only). Bit layout: a branch control register (CBCR) has
-@@ -57,9 +60,57 @@ void g7_gpu_init(void);
+@@ -57,9 +63,81 @@ void g7_gpu_init(void);
  #define G7G_GMU_AO_COUNTER_L        0x1f888u
  #define G7G_GMU_SPTPRAC_STATUS      0x1f8d0u
  
@@ -823,16 +826,40 @@
 +#define G7G_PDC_TCS3                0x15d6u
 +#define G7G_A630_GMU_CHIPID         0x06030200u /* chip 6.3.0.2 in the GMU's packing */
 +
++/* Stage 4: GX (graphics core) power through the GMU. */
++#define G7G_GMU_BOOT_SLUMBER_OPTION 0x1cbf8u
++#define G7G_GMU_GX_VOTE_IDX         0x1cbf9u
++#define G7G_GMU_MX_VOTE_IDX         0x1cbfau
++#define G7G_GMU_GX_SPTPRAC_PWR_CTRL 0x1a881u
++#define G7G_GMU_HOST2GMU_SET        0x1f994u
++#define G7G_GMU_GMU2HOST_CLR        0x1f991u
++#define G7G_OOB_BOOT_SLUMBER_SET    22
++#define G7G_OOB_BOOT_SLUMBER_ACK    30
++/* RPMh command DB (AOP-owned, read only): locator in AOP message RAM, else the DT address. */
++#define G7G_CMDDB_LOCATOR_PA        0x0c3f000cu
++#define G7G_CMDDB_DT_PA             0x85fe0000u
++#define G7G_CMDDB_DT_SIZE           0x00020000u
++#define G7G_CMDDB_MAGIC             0x0c0330dbu
++#define G7G_CMDDB_HEADER            144u
++#define G7G_CMDDB_ENTRY             24u
++#define G7G_CMDDB_SLAVE_ARC         3u
++#define G7G_RPMH_LEVEL_SVS          128u        /* RPMH_REGULATOR_LEVEL_SVS: GPU 342 MHz */
++/* GPU core registers (GX domain), dword offsets from the GPU base. */
++#define G7G_GPU_REG_SIZE            0x00010000u
++#define G7G_RBBM_STATUS             0x0210u
++#define G7G_CP_ALWAYS_ON_LO         0x0980u
++
 +#include "g7_gmu_fw.h"
 +
  static int g7g_chan;
  static struct {
 -	vm_offset_t gcc, gpucc, gmu;
-+	vm_offset_t gcc, gpucc, gmu, pdc, pdcseq;
++	vm_offset_t gcc, gpucc, gmu, pdc, pdcseq, db, gpu;
++	uint32_t db_size;
  	unsigned level;
  	char summary[160];
  } g7g;
-@@ -86,6 +137,42 @@ g7g_gmu_rd(uint32_t dword)
+@@ -86,6 +164,42 @@ g7g_gmu_rd(uint32_t dword)
  	return g7g_rd(g7g.gmu, dword * 4u - (G7G_GMU_PA - G7G_GPU_PA));
  }
  
@@ -875,7 +902,7 @@
  static void
  g7g_sleep(unsigned ms)
  {
-@@ -119,6 +206,173 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
+@@ -119,6 +233,350 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
  	return false;
  }
  
@@ -947,6 +974,180 @@
 +	printf("G7 GPU: stage3 RSC/PDC programmed, RSC sleep status %#x (%s)\n", st,
 +	    (st & (1u << 16)) ? "asleep" : "did not sleep");
 +	return true;
++}
++
++/* ---- RPMh command DB (read only) ---- */
++
++static uint16_t
++g7g_db16(uint32_t off)
++{
++	uint32_t v = g7g_rd(g7g.db, off & ~3u);
++	return (uint16_t)(v >> (8u * (off & 3u)));
++}
++
++static bool
++g7g_db_in(uint32_t off, uint32_t len)
++{
++	return off <= g7g.db_size && len <= g7g.db_size - off;
++}
++
++/* Map the command DB: the AOP's locator first, the SDM845 DT address second. */
++static bool
++g7g_db_map(void)
++{
++	if (g7g.db) {
++		return true;
++	}
++	uint32_t pa = 0, size = 0;
++	vm_offset_t loc = ml_io_map(G7G_CMDDB_LOCATOR_PA & ~0xfffu, 0x1000);
++	if (loc) {
++		pa = g7g_rd(loc, G7G_CMDDB_LOCATOR_PA & 0xfffu);
++		size = g7g_rd(loc, (G7G_CMDDB_LOCATOR_PA & 0xfffu) + 4u);
++	}
++	printf("G7 GPU: stage4 cmd-db locator pa %#x size %#x\n", pa, size);
++	if (pa < 0x80000000u || (pa & 3u) || size < G7G_CMDDB_HEADER || size > 0x100000u) {
++		pa = G7G_CMDDB_DT_PA;
++		size = G7G_CMDDB_DT_SIZE;
++	}
++	g7g.db = ml_io_map(pa, size);
++	if (!g7g.db) {
++		return false;
++	}
++	g7g.db_size = size;
++	if (g7g_rd(g7g.db, 4) != G7G_CMDDB_MAGIC) {
++		printf("G7 GPU: stage4 no cmd-db at %#x (magic %#x)\n", pa, g7g_rd(g7g.db, 4));
++		g7g.db = 0;
++		return false;
++	}
++	return true;
++}
++
++/*
++ * Index of the first ARC level >= want in the resource's level table
++ * (aux data: little-endian u16 levels); if none is that high, the highest
++ * non-zero level. -1 if the resource is not found.
++ */
++static int
++g7g_arc_index(const char *name, unsigned want, unsigned *level_out)
++{
++	uint32_t key[2] = { 0, 0 };
++	for (unsigned i = 0; i < 8 && name[i]; i++) {
++		key[i / 4] |= (uint32_t)(uint8_t)name[i] << (8u * (i % 4));
++	}
++	for (unsigned s = 0; s < 8; s++) {
++		uint32_t h = 8u + 16u * s;
++		unsigned slave = g7g_db16(h);
++		if (!slave) {
++			break;
++		}
++		if (slave != G7G_CMDDB_SLAVE_ARC) {
++			continue;
++		}
++		uint32_t entries = G7G_CMDDB_HEADER + g7g_db16(h + 2);
++		uint32_t aux = G7G_CMDDB_HEADER + g7g_db16(h + 4);
++		unsigned count = g7g_db16(h + 6);
++		if ((entries & 3u) || !g7g_db_in(entries, count * G7G_CMDDB_ENTRY)) {
++			return -1;
++		}
++		for (unsigned j = 0; j < count; j++) {
++			uint32_t e = entries + G7G_CMDDB_ENTRY * j;
++			if (g7g_rd(g7g.db, e) != key[0] || g7g_rd(g7g.db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t len = g7g_db16(e + 20), off = aux + g7g_db16(e + 22);
++			if (!g7g_db_in(off, len) || len < 2) {
++				return -1;
++			}
++			int best = -1, top = -1;
++			unsigned n = len / 2u, lv = 0;
++			char list[96];
++			int at = 0;
++			for (unsigned k = 0; k < n && k < 16; k++) {
++				unsigned v = g7g_db16(off + 2u * k);
++				at += snprintf(list + at, sizeof(list) - (size_t)at, "%s%u", k ? "," : "", v);
++				if (at >= (int)sizeof(list)) {
++					at = (int)sizeof(list) - 1;
++				}
++				if (best < 0 && v >= want) {
++					best = (int)k;
++					lv = v;
++				}
++				if (v) {
++					top = (int)k;
++				}
++			}
++			printf("G7 GPU: stage4 %s levels [%s]\n", name, list);
++			if (best < 0 && top >= 0) {
++				best = top;
++				lv = g7g_db16(off + 2u * (unsigned)top);
++			}
++			if (level_out) {
++				*level_out = lv;
++			}
++			return best;
++		}
++	}
++	return -1;
++}
++
++/*
++ * Stage 4: ask the running GMU firmware to power the GX domain (the GPU
++ * core) at the SVS level, take CPU control of the SP/TP power switch, and
++ * then, only if the GMU reports GX powered and clocked, read two GPU core
++ * registers (a GX read with GX off would hang the bus).
++ */
++static void
++g7g_stage4(void)
++{
++	if (!g7g_db_map()) {
++		snprintf(g7g.summary, sizeof(g7g.summary), "stage4: GMU running, but the RPMh command DB was not found");
++		return;
++	}
++	unsigned gl = 0, ml = 0;
++	int gi = g7g_arc_index("gfx.lvl", G7G_RPMH_LEVEL_SVS, &gl);
++	int mi = g7g_arc_index("mx.lvl", G7G_RPMH_LEVEL_SVS, &ml);
++	if (gi < 0 || mi < 0) {
++		snprintf(g7g.summary, sizeof(g7g.summary), "stage4: GMU running, gfx/mx levels not in cmd-db (%d/%d)", gi, mi);
++		return;
++	}
++	g7g_gmu_wr(G7G_GMU_BOOT_SLUMBER_OPTION, 0);
++	g7g_gmu_wr(G7G_GMU_GX_VOTE_IDX, (uint32_t)gi);
++	g7g_gmu_wr(G7G_GMU_MX_VOTE_IDX, (uint32_t)mi);
++	g7g_gmu_wr(G7G_GMU_HOST2GMU_SET, 1u << G7G_OOB_BOOT_SLUMBER_SET);
++	uint32_t info = 0;
++	bool acked = g7g_gmu_wait(G7G_GMU_GMU2HOST_INFO, 1u << G7G_OOB_BOOT_SLUMBER_ACK,
++	    1u << G7G_OOB_BOOT_SLUMBER_ACK, 200000, &info);
++	g7g_gmu_wr(G7G_GMU_GMU2HOST_CLR, 1u << G7G_OOB_BOOT_SLUMBER_ACK);
++	printf("G7 GPU: stage4 boot vote gfx idx %d (level %u) mx idx %d (level %u): GMU %s (info %#x)\n",
++	    gi, gl, mi, ml, acked ? "acked" : "NO ACK", info);
++	if (!acked) {
++		snprintf(g7g.summary, sizeof(g7g.summary), "stage4: GMU running, but it did not ack the GX boot request (%#x)", info);
++		return;
++	}
++	/* SP/TP power under CPU control: on. */
++	g7g_gmu_wr(G7G_GMU_GX_SPTPRAC_PWR_CTRL, 0x778000u);
++	uint32_t st = 0;
++	bool sptp = g7g_gmu_wait(G7G_GMU_SPTPRAC_STATUS, 0x38u, 0x28u, 20000, &st);
++	bool gx = !(st & ((1u << 6) | (1u << 7)));
++	printf("G7 GPU: stage4 sptprac %s, pwr/clk status %#x: GX %s\n", sptp ? "on" : "FAILED", st,
++	    gx ? "POWERED AND CLOCKED" : "still off");
++	if (!gx) {
++		snprintf(g7g.summary, sizeof(g7g.summary), "stage4: GMU acked, but GX is still off (status %#x)", st);
++		return;
++	}
++	g7g.gpu = ml_io_map(G7G_GPU_PA, G7G_GPU_REG_SIZE);
++	if (!g7g.gpu) {
++		snprintf(g7g.summary, sizeof(g7g.summary), "stage4: GX on, GPU register map failed");
++		return;
++	}
++	uint32_t rbbm = g7g_rd(g7g.gpu, G7G_RBBM_STATUS * 4u);
++	uint32_t c1 = g7g_rd(g7g.gpu, G7G_CP_ALWAYS_ON_LO * 4u);
++	delay(1000);
++	uint32_t c2 = g7g_rd(g7g.gpu, G7G_CP_ALWAYS_ON_LO * 4u);
++	printf("G7 GPU: stage4 GPU core rbbm_status %#x, cp always-on %#x -> %#x\n", rbbm, c1, c2);
++	snprintf(g7g.summary, sizeof(g7g.summary),
++	    "stage4: GX POWERED, GPU core %s (rbbm %#x, counter %#x -> %#x)",
++	    c1 != c2 ? "ANSWERS" : "silent", rbbm, c1, c2);
 +}
 +
 +/*
@@ -1044,12 +1245,15 @@
 +	    "stage3: GMU FIRMWARE RUNNING (init %#x in %d ms, rpmh %#x)%s" :
 +	    "stage3: GMU firmware did not start (init %#x after %d ms, rpmh %#x)%s",
 +	    init, ms, g7g_gmu_rd(G7G_GMU_RPMH_POWER_STATE), (g2h & (1u << 23)) ? ", CM3 FAULT" : "");
++	if (up && g7g.level >= 4) {
++		g7g_stage4();
++	}
 +}
 +
  /*
   * Stage 2: the GPU's bus clocks, the CX power domain and the GMU clocks
   * (GMU core clock from the 19.2 MHz crystal: slow but needs no PLL), then
-@@ -184,6 +438,9 @@ g7g_stage2(void)
+@@ -184,6 +642,9 @@ g7g_stage2(void)
  	snprintf(g7g.summary, sizeof(g7g.summary),
  	    "stage2: CX on, GMU clocks on, GMU %s (counter %#x -> %#x), CM3 reset %#x",
  	    ao1 != ao2 ? "ALIVE" : "not counting", ao1, ao2, rst);
