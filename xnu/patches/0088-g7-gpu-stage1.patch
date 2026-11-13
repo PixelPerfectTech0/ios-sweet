@@ -1,10 +1,11 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -112,6 +112,7 @@ bsd/dev/sweet_rpmh.c			standard
+@@ -112,6 +112,8 @@ bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
  bsd/dev/sweet_usb.c			standard
  bsd/dev/sweet_g7touch.c			standard
 +bsd/dev/g7_gpu.c			standard
++bsd/dev/g7_perf.c			standard
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
@@ -272,21 +273,140 @@
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/g7_perf.c
+@@ -0,0 +1,114 @@
++/*
++ * LG G7 ThinQ (SDM845): CPU clock speed, written for this port.
++ *
++ * Nothing in this kernel sets the CPU frequency, so both clusters stay at
++ * whatever performance level the bootloader left. SDM845's CPU frequency
++ * hardware (OSM) takes a level index per cluster: each cluster has a table
++ * of levels (frequency = L_VAL * 19.2 MHz) and a register that selects one.
++ * The firmware's limits management (LMh) still caps the clock for heat.
++ *
++ * Boot-arg g7perf=N (default 85): run each cluster at the highest table
++ * level at or below N % of its top normal level; g7perf=0 leaves them alone.
++ * Register layout: Linux drivers/cpufreq/qcom-cpufreq-hw.c (qcom_soc_data):
++ * enable 0x0, frequency table 0x110 (32-byte rows), current vote 0x704,
++ * performance state 0x920. Lines start with "G7 PERF:".
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void g7_perf_init(void);
++
++#define G7P_ENABLE      0x000u
++#define G7P_LUT         0x110u
++#define G7P_ROW         32u
++#define G7P_ROWS        40u
++#define G7P_VOTE        0x704u
++#define G7P_STATE       0x920u
++#define G7P_XO_KHZ      19200u
++
++static const struct {
++	const char *name;
++	uint32_t pa;
++} g7p_domains[] = {
++	{ "little (A55)", 0x17d43000u },
++	{ "big (A75)", 0x17d45800u },
++};
++
++static uint32_t
++g7p_rd(vm_offset_t b, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(b + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++g7p_domain(const char *name, uint32_t pa, unsigned pct)
++{
++	vm_offset_t b = ml_io_map(pa, 0x1000);
++	if (!b) {
++		printf("G7 PERF: %s map failed\n", name);
++		return;
++	}
++	if (!(g7p_rd(b, G7P_ENABLE) & 1u)) {
++		printf("G7 PERF: %s frequency hardware not enabled; left alone\n", name);
++		return;
++	}
++	uint32_t khz[G7P_ROWS];
++	unsigned n = 0, top = 0;
++	uint32_t prev = 0;
++	for (unsigned i = 0; i < G7P_ROWS; i++) {
++		uint32_t row = g7p_rd(b, G7P_LUT + i * G7P_ROW);
++		uint32_t src = (row >> 30) & 3u, lval = row & 0xffu, cores = (row >> 16) & 7u;
++		uint32_t f = src ? lval * G7P_XO_KHZ : 0;
++		if (i > 0 && f == prev) {
++			break;          /* a repeated row ends the table */
++		}
++		khz[i] = (cores == 1u) ? 0 : f;  /* core count 1 marks a boost level: skip */
++		if (khz[i] > khz[top]) {
++			top = i;
++		}
++		prev = f;
++		n = i + 1;
++	}
++	if (n == 0 || khz[top] == 0) {
++		printf("G7 PERF: %s empty frequency table\n", name);
++		return;
++	}
++	uint32_t want = (uint32_t)((uint64_t)khz[top] * pct / 100u), pick = 0;
++	for (unsigned i = 0; i < n; i++) {
++		if (khz[i] && khz[i] <= want && khz[i] >= khz[pick]) {
++			pick = i;
++		}
++	}
++	uint32_t before = g7p_rd(b, G7P_STATE), vote = g7p_rd(b, G7P_VOTE) & 0x3ffu;
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(b + G7P_STATE) = pick;
++	__asm__ volatile ("dsb osh" ::: "memory");
++	printf("G7 PERF: %s %u levels, max %u MHz; level %u (%u MHz) -> level %u (%u MHz), now %u MHz\n",
++	    name, n, khz[top] / 1000u, before, before < n ? khz[before] / 1000u : 0, pick,
++	    khz[pick] / 1000u, ((g7p_rd(b, G7P_VOTE) & 0x3ffu) * G7P_XO_KHZ) / 1000u);
++	(void)vote;
++}
++
++void
++g7_perf_init(void)
++{
++	unsigned pct = 85;
++	(void)PE_parse_boot_argn("g7perf", &pct, sizeof(pct));
++	if (pct == 0) {
++		printf("G7 PERF: off (g7perf=0)\n");
++		return;
++	}
++	if (pct > 100) {
++		pct = 100;
++	}
++	for (unsigned d = 0; d < sizeof(g7p_domains) / sizeof(g7p_domains[0]); d++) {
++		g7p_domain(g7p_domains[d].name, g7p_domains[d].pa, pct);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -54,6 +54,7 @@ extern void sweet_keys_init(void);
+@@ -54,6 +54,8 @@ extern void sweet_keys_init(void);
  extern void sweet_touch_init(void);
  extern void sweet_usb_probe(void);
  extern void sweet_g7touch_init(void);
 +extern void g7_gpu_init(void);
++extern void g7_perf_init(void);
  
  #define REG_CAP         0x00
  #define REG_IS          0x20
-@@ -662,6 +663,7 @@ sweet_ufs_init(void)
+@@ -662,6 +664,8 @@ sweet_ufs_init(void)
  	sweet_touch_init();
  	sweet_usb_probe();
  	sweet_g7touch_init();
 +	g7_gpu_init();          /* G7 Adreno 630, off unless g7gpu=N */
++	g7_perf_init();         /* G7 CPU clock speed (g7perf=%, default 85) */
  	return 0;
  }
  
