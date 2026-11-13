@@ -776,7 +776,7 @@
   *
   * Offsets: Linux drivers/clk/qcom/gcc-sdm845.c and gpucc-sdm845.c
   * (register facts only). Bit layout: a branch control register (CBCR) has
-@@ -57,9 +63,81 @@ void g7_gpu_init(void);
+@@ -57,9 +63,82 @@ void g7_gpu_init(void);
  #define G7G_GMU_AO_COUNTER_L        0x1f888u
  #define G7G_GMU_SPTPRAC_STATUS      0x1f8d0u
  
@@ -856,10 +856,11 @@
 -	vm_offset_t gcc, gpucc, gmu;
 +	vm_offset_t gcc, gpucc, gmu, pdc, pdcseq, db, gpu;
 +	uint32_t db_size;
++	char smmu[160];
  	unsigned level;
  	char summary[160];
  } g7g;
-@@ -86,6 +164,42 @@ g7g_gmu_rd(uint32_t dword)
+@@ -86,6 +165,42 @@ g7g_gmu_rd(uint32_t dword)
  	return g7g_rd(g7g.gmu, dword * 4u - (G7G_GMU_PA - G7G_GPU_PA));
  }
  
@@ -902,7 +903,7 @@
  static void
  g7g_sleep(unsigned ms)
  {
-@@ -119,6 +233,350 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
+@@ -119,6 +234,384 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
  	return false;
  }
  
@@ -974,6 +975,40 @@
 +	printf("G7 GPU: stage3 RSC/PDC programmed, RSC sleep status %#x (%s)\n", st,
 +	    (st & (1u << 16)) ? "asleep" : "did not sleep");
 +	return true;
++}
++
++/*
++ * GPU SMMU (ARM SMMU v2 at 0x05040000, CX domain, read only): is GPU memory
++ * access translated, bypassed or blocked? Decides how the next stages give
++ * the GPU memory (ring buffer, SQE firmware, HFI queues).
++ */
++#define G7G_SMMU_PA     0x05040000u
++#define G7G_SMMU_SIZE   0x00010000u
++
++static void
++g7g_smmu_report(void)
++{
++	vm_offset_t s = ml_io_map(G7G_SMMU_PA, G7G_SMMU_SIZE);
++	if (!s) {
++		snprintf(g7g.smmu, sizeof(g7g.smmu), "smmu: map failed");
++		return;
++	}
++	uint32_t cr0 = g7g_rd(s, 0x0), id0 = g7g_rd(s, 0x20), id1 = g7g_rd(s, 0x24);
++	unsigned nsmr = id0 & 0xffu, ncb = id1 & 0xffu;
++	printf("G7 GPU: smmu sCR0 %#x sIDR0 %#x sIDR1 %#x (%u stream matches, %u contexts)\n",
++	    cr0, id0, id1, nsmr, ncb);
++	unsigned used = 0;
++	for (unsigned i = 0; i < nsmr && i < 16; i++) {
++		uint32_t smr = g7g_rd(s, 0x800u + 4u * i), s2cr = g7g_rd(s, 0xc00u + 4u * i);
++		if (smr & (1u << 31)) {
++			used++;
++			printf("G7 GPU: smmu SMR%u %#x (id %#x mask %#x) S2CR %#x (type %u cb %u)\n", i, smr,
++			    smr & 0x7fffu, (smr >> 16) & 0x7fffu, s2cr, (s2cr >> 16) & 3u, s2cr & 0xffu);
++		}
++	}
++	snprintf(g7g.smmu, sizeof(g7g.smmu), "smmu: %s, unmatched streams %s, %u of %u matches in use",
++	    (cr0 & 1u) ? "CLIENTPD (all bypass)" : "enabled",
++	    (cr0 & (1u << 10)) ? "fault" : "bypass", used, nsmr);
 +}
 +
 +/* ---- RPMh command DB (read only) ---- */
@@ -1253,13 +1288,26 @@
  /*
   * Stage 2: the GPU's bus clocks, the CX power domain and the GMU clocks
   * (GMU core clock from the 19.2 MHz crystal: slow but needs no PLL), then
-@@ -184,6 +642,9 @@ g7g_stage2(void)
+@@ -184,6 +677,12 @@ g7g_stage2(void)
  	snprintf(g7g.summary, sizeof(g7g.summary),
  	    "stage2: CX on, GMU clocks on, GMU %s (counter %#x -> %#x), CM3 reset %#x",
  	    ao1 != ao2 ? "ALIVE" : "not counting", ao1, ao2, rst);
 +	if (g7g.level >= 3 && ao1 != ao2) {
 +		g7g_stage3();
 +	}
++	if (g7g.level >= 5) {
++		g7g_smmu_report();
++	}
  }
  
  static void
+@@ -241,6 +740,9 @@ g7g_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ 	for (int i = 0; i < 60; i++) {
+ 		printf("G7 GPU: %s\n", g7g.summary[0] ? g7g.summary : "no result");
++		if (g7g.smmu[0]) {
++			printf("G7 GPU: %s\n", g7g.smmu);
++		}
+ 		g7g_sleep(10000);
+ 	}
+ 	(void)thread_terminate(current_thread());
