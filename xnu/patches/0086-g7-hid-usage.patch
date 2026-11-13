@@ -1,0 +1,41 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -330,6 +330,7 @@ class SweetHIDButtons : public IOHIDEventService {
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void key(UInt32 usage, bool down);
++	void keyUsage(UInt32 page, UInt32 usage, bool down);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Consumer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Csmr_ConsumerControl; }
+@@ -399,7 +400,13 @@ SweetHIDButtons::start(IOService *provider)
+ void
+ SweetHIDButtons::key(UInt32 usage, bool down)
+ {
+-	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, usage, down);
++	keyUsage(kHIDPage_Consumer, usage, down);
++}
++
++void
++SweetHIDButtons::keyUsage(UInt32 page, UInt32 usage, bool down)
++{
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), page, usage, down);
+ 
+ 	if (event) {
+ 		IOLog("SWEET HID: key 0x%x %s (%u clients)\n", (unsigned)usage, down ? "down" : "up",
+@@ -552,6 +559,15 @@ sweet_hid_key(int key, int down)
+ 	}
+ }
+ 
++/* Any HID usage, e.g. the G7 assistant key acting as the ring/silent switch. */
++extern "C" void
++sweet_hid_usage(unsigned page, unsigned usage, int down)
++{
++	if (gSweetButtons) {
++		gSweetButtons->keyUsage(page, usage, down != 0);
++	}
++}
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
