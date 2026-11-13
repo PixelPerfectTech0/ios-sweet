@@ -22,7 +22,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_g7touch.c
-@@ -0,0 +1,858 @@
+@@ -0,0 +1,859 @@
 +/*
 + * LG G7 ThinQ (judyln, SDM845): SiliconWorks SW49410 in-cell touch over SPI.
 + *
@@ -817,7 +817,7 @@
 +		printf("G7 TOUCH: init sequence sent\n");
 +		g7_stage(6, bad ? G7_RED : G7_GREEN);
 +	}
-+	unsigned errors = 0, frames = 0, ticks = 0, shown = 0;
++	unsigned errors = 0, frames = 0, ticks = 0, shown = 0, alive_reports = 0;
 +	while (!g7.dead) {
 +		err = g7_poll(&frames);
 +		g7.stage[6] = err ? G7_RED : G7_GREEN;
@@ -843,7 +843,8 @@
 +			if (!err && frames == 0) {
 +				g7_dump("idle");
 +			}
-+			ticks = frames > 0 ? 301 : 0;
++			/* stop after the first touch, or after ~1 minute (12 reports) */
++			ticks = (frames > 0 || ++alive_reports >= 12) ? 301 : 0;
 +		}
 +		g7_sleep(15);
 +	}
