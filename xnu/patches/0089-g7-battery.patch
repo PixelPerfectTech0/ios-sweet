@@ -1,0 +1,81 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -27,6 +27,9 @@ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
++	bool fG7, fG7Published;                 /* sweetbattery=2: LG G7 PMI8998 */
++	int fLastG7Percent, fLastG7State, fLastG7Usb;
++	bool pollG7(void);
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+@@ -52,6 +55,8 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+ 	fTimerAdded = fRunning = fReal = false;
++	fG7 = fG7Published = false;
++	fLastG7Percent = fLastG7State = fLastG7Usb = -1;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -203,9 +208,49 @@ SweetBattery::estimatePercent(unsigned mv)
+ 	return 100;
+ }
+ 
++/* G7 (sweetbattery=2): PMI8998 on SPMI SID 2. Returns false if unreadable. */
++bool
++SweetBattery::pollG7(void)
++{
++	uint8_t soc = 0, soc2 = 0, usb = 0, charger = 0;
++	if (sweet_spmi_read(2, 0x4009, &soc) || sweet_spmi_read(2, 0x4009, &soc2) ||
++	    sweet_spmi_read(2, 0x1310, &usb) || sweet_spmi_read(2, 0x1006, &charger)) {
++		return false;
++	}
++	if (soc != soc2 || soc == 0) {
++		return false;   /* torn or not yet valid: keep the last published value */
++	}
++	unsigned percent = ((unsigned)soc * 100u + 127u) / 255u;
++	if (percent < 1) {
++		percent = 1;
++	}
++	bool external = (usb & 0x10u) != 0;
++	unsigned state = charger & 7u;
++	bool full = external && (state == 5 || percent >= 100);
++	bool charging = external && state <= 4 && !full;
++	/* Rough voltage from the charge level, only for the battery details page. */
++	unsigned mv = 3400 + percent * 8;
++	publish(full ? 100 : percent, mv, 0, external, external, charging, full, true, false);
++	if (fLastG7Percent != (int)percent || fLastG7State != (int)state || fLastG7Usb != (int)external) {
++		IOLog("SWEET BATTERY: G7 PMI8998 soc %u/255 = %u%%, usb %d, charger state %u\n",
++		    soc, percent, external, state);
++		fLastG7Percent = (int)percent;
++		fLastG7State = (int)state;
++		fLastG7Usb = (int)external;
++	}
++	return true;
++}
++
+ void
+ SweetBattery::poll(void)
+ {
++	if (fG7) {
++		if (!pollG7() && !fG7Published) {
++			publish(100, 4200, 0, true, true, false, true, false, false);
++		}
++		fG7Published = true;
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -264,7 +309,8 @@ SweetBattery::start(IOService *provider)
+ 	}
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	fReal = (real == 1 || real == 2) && sweet_spmi_init() == 0;
++	fG7 = fReal && real == 2;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
