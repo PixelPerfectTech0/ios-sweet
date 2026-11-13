@@ -1,0 +1,117 @@
+name: metal-plugin-ios
+
+# NativeAdrenoMetal.bundle for iOS 16 arm64: the Metal plugin iOS's Metal discovery loads for our
+# IOAcceleratorES service (MetalPluginName NativeAdrenoMetal). It carries the AdrenoMetal frontend (MIT),
+# the metal2vulkan bridge (from metal-bridge-ios) and Turnip (from turnip-ios), ad-hoc signed with 4 KiB pages.
+
+on:
+  workflow_dispatch:
+    inputs:
+      turnip_run:
+        description: turnip-ios run id
+        required: true
+      bridge_run:
+        description: metal-bridge-ios run id
+        required: true
+
+env:
+  ADRENO_METAL_REPO: https://github.com/UniXNU/AdrenoMetal
+  ADRENO_METAL_COMMIT: 73d582fd4d5772b1f5fa83581a25077a16f2b6cd
+  UNIXNU_REPO: https://github.com/UniXNU/UniXNU
+  UNIXNU_COMMIT: 7d85ede80092050f4d87f72ac7229bb605ce07fb
+  MESA_COMMIT: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+  MESA_UPSTREAM: https://gitlab.freedesktop.org/mesa/mesa.git
+  MESA_MIRROR: https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: turnip-ios
+          path: turnip
+          run-id: ${{ inputs.turnip_run }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: metal-bridge-ios
+          path: bridge
+          run-id: ${{ inputs.bridge_run }}
+          github-token: ${{ github.token }}
+
+      - name: Sources
+        run: |
+          for r in "am $ADRENO_METAL_REPO $ADRENO_METAL_COMMIT" "ux $UNIXNU_REPO $UNIXNU_COMMIT"; do
+            set -- $r; git init -q $1; git -C $1 remote add origin $2; git -C $1 fetch -q --depth 1 origin $3; git -C $1 checkout -q FETCH_HEAD
+          done
+          git init -q mesa && git -C mesa remote add origin "$MESA_UPSTREAM"
+          git -C mesa sparse-checkout set include
+          git -C mesa fetch -q --depth 1 --filter=blob:none origin "$MESA_COMMIT" || { git -C mesa remote set-url origin "$MESA_MIRROR"; git -C mesa fetch -q --depth 1 --filter=blob:none origin "$MESA_COMMIT"; }
+          git -C mesa checkout -q FETCH_HEAD
+          ls turnip bridge mesa/include/vulkan | head -20
+
+      - name: Smoke shaders
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+        run: |
+          brew install shaderc spirv-tools
+          mkdir -p ux/drivers && rm -rf ux/drivers/AdrenoMetal && ln -s "$PWD/am" ux/drivers/AdrenoMetal
+          python3 ux/scripts/gen-turnip-smoke-shaders.py
+          ls -la ux/build/turnip-smoke
+
+      - name: Bundle
+        run: |
+          set -x
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          B=out/NativeAdrenoMetal.bundle; mkdir -p "$B"
+          BASE="-target arm64-apple-ios16.0 -isysroot $SDK -O2 -g -fstack-protector-strong"
+          xcrun clang $BASE -std=c11 -c ux/kits/AdrenoPM4/AdrenoPM4.c -o out/AdrenoPM4.o
+          set +e
+          xcrun clang++ $BASE -std=c++17 -fobjc-arc -Wno-deprecated-declarations -Wno-unguarded-availability-new -bundle \
+            -DNATIVE_METAL_BUILD_ID="\"g7-${GITHUB_SHA}\"" \
+            -I gpu/abi -I ux/kits/AdrenoPM4 -I mesa/include -I ux/build/turnip-smoke -I am \
+            -x objective-c++ am/NativeAdrenoMetalPlugin.mm am/NativeBridgeMetalFrontend.mm -x none \
+            out/AdrenoPM4.o bridge/libadreno_metal_bridge.a -Wl,-dead_strip -lobjc \
+            -framework Foundation -framework Metal -framework IOSurface -o "$B/NativeAdrenoMetal" > out/link.log 2>&1
+          rc=$?
+          grep -E 'error|undefined' out/link.log | head -80
+          test $rc = 0 || exit $rc
+          set -e
+          strip -x "$B/NativeAdrenoMetal"
+          rm -rf "$B/NativeAdrenoMetal.dSYM"
+          cp turnip/libvulkan_freedreno.dylib "$B/"
+          strip -x "$B/libvulkan_freedreno.dylib"
+          python3 ux/scripts/macho-self-bind-weak-imports.py "$B/libvulkan_freedreno.dylib"
+          codesign --force --sign - --pagesize 4096 --identifier org.blu-sharky.turnip "$B/libvulkan_freedreno.dylib"
+          cat > "$B/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleIdentifier</key><string>org.blu-sharky.NativeAdrenoMetal</string>
+            <key>CFBundleExecutable</key><string>NativeAdrenoMetal</string>
+            <key>CFBundlePackageType</key><string>BNDL</string>
+            <key>CFBundleVersion</key><string>1</string>
+            <key>CFBundleShortVersionString</key><string>1</string>
+            <key>NSPrincipalClass</key><string>NativeAdrenoMetalDevice</string>
+            <key>MinimumOSVersion</key><string>16.0</string>
+          </dict></plist>
+          EOF
+          codesign --force --sign - --pagesize 4096 --identifier org.blu-sharky.NativeAdrenoMetal "$B"
+          codesign --verify --strict "$B"
+          codesign --display --verbose=4 "$B" 2>&1 | grep -E 'CDHash=|Page size'
+          ls -la "$B"
+          cd out && tar czf NativeAdrenoMetal.bundle.tgz NativeAdrenoMetal.bundle
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: metal-plugin-ios
+          path: |
+            out/NativeAdrenoMetal.bundle.tgz
+            out/link.log
