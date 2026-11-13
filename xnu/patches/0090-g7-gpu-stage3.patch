@@ -787,7 +787,7 @@
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  extern kern_return_t thread_terminate(thread_t);
-@@ -57,9 +67,153 @@ void g7_gpu_init(void);
+@@ -57,9 +67,154 @@ void g7_gpu_init(void);
  #define G7G_GMU_AO_COUNTER_L        0x1f888u
  #define G7G_GMU_SPTPRAC_STATUS      0x1f8d0u
  
@@ -859,6 +859,7 @@
 +#define G7G_GPU_REG_SIZE            0x00040000u
 +#define G7G_RBBM_STATUS             0x0210u
 +#define G7G_CP_ALWAYS_ON_LO         0x0980u
++#define G7G_CP_SCRATCH0             0x0883u   /* CP_SCRATCH_REG(0) */
 +
 +/* Stage 6: command processor (dword offsets, Mesa a6xx.xml, A6XX variants). */
 +#define G7G_OOB_GPU_SET             16
@@ -942,7 +943,7 @@
  	unsigned level;
  	char summary[160];
  } g7g;
-@@ -86,6 +240,42 @@ g7g_gmu_rd(uint32_t dword)
+@@ -86,6 +241,42 @@ g7g_gmu_rd(uint32_t dword)
  	return g7g_rd(g7g.gmu, dword * 4u - (G7G_GMU_PA - G7G_GPU_PA));
  }
  
@@ -985,7 +986,7 @@
  static void
  g7g_sleep(unsigned ms)
  {
-@@ -119,6 +309,816 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
+@@ -119,6 +310,829 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
  	return false;
  }
  
@@ -1688,15 +1689,28 @@
 +		snprintf(g7g.summary, sizeof(g7g.summary), "stage4: GX on, GPU register map failed");
 +		return;
 +	}
++	/* Keep the GPU on while we look at it (OOB GPU_SET), as Linux does before any GPU register access. */
++	uint32_t hinfo = 0;
++	bool held = g7g_gpu_hold(&hinfo);
 +	uint32_t rbbm = g7g_rd(g7g.gpu, G7G_RBBM_STATUS * 4u);
 +	uint32_t c1 = g7g_rd(g7g.gpu, G7G_CP_ALWAYS_ON_LO * 4u);
 +	delay(1000);
 +	uint32_t c2 = g7g_rd(g7g.gpu, G7G_CP_ALWAYS_ON_LO * 4u);
-+	printf("G7 GPU: stage4 GPU core rbbm_status %#x, cp always-on %#x -> %#x\n", rbbm, c1, c2);
++	/* Write/read-back of a CP scratch register: proves the GX core is powered and clocked. */
++	uint32_t old0 = g7g_rd(g7g.gpu, G7G_CP_SCRATCH0 * 4u);
++	g7g_wr(g7g.gpu, G7G_CP_SCRATCH0 * 4u, 0x6630a5c3u);
++	uint32_t rb1 = g7g_rd(g7g.gpu, G7G_CP_SCRATCH0 * 4u);
++	g7g_wr(g7g.gpu, G7G_CP_SCRATCH0 * 4u, 0x99cf5a3cu);
++	uint32_t rb2 = g7g_rd(g7g.gpu, G7G_CP_SCRATCH0 * 4u);
++	g7g_wr(g7g.gpu, G7G_CP_SCRATCH0 * 4u, old0);
++	bool wr_ok = rb1 == 0x6630a5c3u && rb2 == 0x99cf5a3cu;
++	printf("G7 GPU: stage4 hold %s (%#x), rbbm_status %#x, cp always-on %#x -> %#x, scratch %#x/%#x\n",
++	    held ? "acked" : "NO ACK", hinfo, rbbm, c1, c2, rb1, rb2);
 +	snprintf(g7g.summary, sizeof(g7g.summary),
-+	    "stage4: GX POWERED, GPU core %s (rbbm %#x, counter %#x -> %#x)",
-+	    c1 != c2 ? "ANSWERS" : "silent", rbbm, c1, c2);
-+	g7g.gx_ok = c1 != c2;
++	    "stage4: GX POWERED, GPU core %s (hold %s, rbbm %#x, counter %s, write test %s %#x)",
++	    (c1 != c2 || wr_ok) ? "ANSWERS" : "silent", held ? "ok" : "NO ACK", rbbm,
++	    c1 != c2 ? "ticks" : "frozen", wr_ok ? "OK" : "FAILED", rb1);
++	g7g.gx_ok = c1 != c2 || wr_ok;
 +}
 +
 +/*
@@ -1802,7 +1816,7 @@
  /*
   * Stage 2: the GPU's bus clocks, the CX power domain and the GMU clocks
   * (GMU core clock from the 19.2 MHz crystal: slow but needs no PLL), then
-@@ -184,6 +1184,38 @@ g7g_stage2(void)
+@@ -184,6 +1198,38 @@ g7g_stage2(void)
  	snprintf(g7g.summary, sizeof(g7g.summary),
  	    "stage2: CX on, GMU clocks on, GMU %s (counter %#x -> %#x), CM3 reset %#x",
  	    ao1 != ao2 ? "ALIVE" : "not counting", ao1, ao2, rst);
@@ -1841,7 +1855,7 @@
  }
  
  static void
-@@ -241,6 +1273,15 @@ g7g_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -241,6 +1287,15 @@ g7g_thread(void *arg __unused, wait_result_t wr __unused)
  	}
  	for (int i = 0; i < 60; i++) {
  		printf("G7 GPU: %s\n", g7g.summary[0] ? g7g.summary : "no result");
@@ -1857,7 +1871,7 @@
  		g7g_sleep(10000);
  	}
  	(void)thread_terminate(current_thread());
-@@ -254,6 +1295,15 @@ g7_gpu_init(void)
+@@ -254,6 +1309,15 @@ g7_gpu_init(void)
  	if (g7g.level == 0) {
  		return;
  	}
