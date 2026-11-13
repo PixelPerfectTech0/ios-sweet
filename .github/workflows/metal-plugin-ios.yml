@@ -87,7 +87,7 @@ jobs:
           rm -rf "$B/NativeAdrenoMetal.dSYM"
           cp turnip/libvulkan_freedreno.dylib "$B/"
           strip -x "$B/libvulkan_freedreno.dylib"
-          python3 ux/scripts/macho-self-bind-weak-imports.py "$B/libvulkan_freedreno.dylib"
+          python3 ux/scripts/macho-self-bind-weak-imports.py "$B/libvulkan_freedreno.dylib" || echo "weak self-bind skipped (classic dyld info on iOS 16)"
           codesign --force --sign - --pagesize 4096 --identifier org.blu-sharky.turnip "$B/libvulkan_freedreno.dylib"
           cat > "$B/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
