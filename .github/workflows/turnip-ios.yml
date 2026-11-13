@@ -1,0 +1,114 @@
+name: turnip-ios
+
+# Turnip (Mesa's Adreno Vulkan driver) cross-built for iOS 16 arm64 with the Darwin
+# kernel backend from UniXNU (gpu/mesa-patches, BSD-2-Clause-Patent; see LICENSE.UniXNU).
+# The backend talks to a NativeAdreno IOKit service (gpu/abi/NativeAdrenoABI.h, MIT);
+# on the LG G7 that service will be our Adreno 630 kernel driver. Nothing here runs a GPU.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ios_min:
+        description: minimum iOS version
+        default: "16.0"
+
+concurrency:
+  group: turnip-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MESA_COMMIT: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+  MESA_MIRROR: https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa
+  MESA_UPSTREAM: https://gitlab.freedesktop.org/mesa/mesa.git
+  IOS_MIN: ${{ inputs.ios_min || '16.0' }}
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          brew install glslang ninja bison flex || true
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q meson mako pyyaml packaging
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+
+      - name: Mesa at the pinned commit
+        run: |
+          mkdir mesa && cd mesa && git init -q
+          git remote add origin "$MESA_UPSTREAM"
+          git fetch -q --depth 1 origin "$MESA_COMMIT" || { git remote set-url origin "$MESA_MIRROR"; git fetch -q --depth 1 origin "$MESA_COMMIT"; }
+          git checkout -q FETCH_HEAD
+          git log -1 --format='%H %cd %s'
+
+      - name: Apply the Darwin patch series
+        run: |
+          cd mesa
+          ok=0; bad=0
+          while read -r p; do
+            [ -z "$p" ] && continue
+            if git apply --whitespace=nowarn "../gpu/mesa-patches/$p"; then echo "applied $p"; ok=$((ok+1));
+            else echo "::warning::FAILED $p"; bad=$((bad+1)); fi
+          done < ../gpu/mesa-patches/series
+          echo "patches applied $ok failed $bad"
+          test -f src/freedreno/vulkan/tu_knl_darwin.cc
+
+      - name: Configure (iOS ${{ env.IOS_MIN }} arm64)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          F="'-target', 'arm64-apple-ios${IOS_MIN}', '-isysroot', '$SDK', '-fstack-protector-strong'"
+          cat > ios.cross <<EOF
+          [binaries]
+          c = '$(xcrun --sdk iphoneos --find clang)'
+          cpp = '$(xcrun --sdk iphoneos --find clang++)'
+          objc = '$(xcrun --sdk iphoneos --find clang)'
+          ar = '$(xcrun --sdk iphoneos --find ar)'
+          strip = '$(xcrun --sdk iphoneos --find strip)'
+          pkg-config = '/usr/bin/false'
+          [host_machine]
+          system = 'darwin'
+          cpu_family = 'aarch64'
+          cpu = 'arm64'
+          endian = 'little'
+          [properties]
+          needs_exe_wrapper = true
+          [built-in options]
+          c_args = [$F]
+          cpp_args = [$F]
+          objc_args = [$F]
+          c_link_args = [$F]
+          cpp_link_args = [$F]
+          objc_link_args = [$F]
+          EOF
+          meson setup build mesa --cross-file ios.cross --wrap-mode=nodownload \
+            -Dgallium-drivers= -Dvulkan-drivers=freedreno -Dfreedreno-kmds=darwin \
+            -Dtu-darwin-abi-dir="$GITHUB_WORKSPACE/gpu/abi" -Dplatforms=macos -Dglx=disabled \
+            -Degl=disabled -Dgbm=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
+            -Dllvm=disabled -Dshared-glapi=disabled -Dxmlconfig=disabled -Dshader-cache=enabled \
+            -Dtools= -Dbuild-tests=false -Dvideo-codecs= -Dvulkan-layers= \
+            -Dlibunwind=disabled -Dlmsensors=disabled -Dvalgrind=disabled -Dexpat=disabled \
+            -Dzstd=disabled -Dbuildtype=release -Db_ndebug=true
+
+      - name: Build
+        run: ninja -C build -k 0 2>&1 | tee build.log | grep -E 'error|FAILED|warning: unused' | head -100; test "${PIPESTATUS[0]}" = 0
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          find build -name 'libvulkan_freedreno*.dylib' -exec cp {} out/ \; || true
+          find build -name 'freedreno_icd*.json' -exec cp {} out/ \; || true
+          cp build.log out/ 2>/dev/null || true
+          ls -la out
+          for f in out/*.dylib; do [ -f "$f" ] && { file "$f"; otool -l "$f" | grep -A4 LC_BUILD_VERSION | head -6; }; done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: turnip-ios
+          path: out
