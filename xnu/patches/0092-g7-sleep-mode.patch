@@ -1,0 +1,304 @@
+--- a/bsd/dev/g7_perf.c
++++ b/bsd/dev/g7_perf.c
+@@ -12,16 +12,54 @@
+  * Register layout: Linux drivers/cpufreq/qcom-cpufreq-hw.c (qcom_soc_data):
+  * enable 0x0, frequency table 0x110 (32-byte rows), current vote 0x704,
+  * performance state 0x920. Lines start with "G7 PERF:".
++ *
++ * Thermal guard (this kernel has no thermal framework, and the phone got
++ * very hot in a pocket at 8 cores / 100 %): a thread reads the CPU die
++ * temperatures every 2 s from TSENS0 (SDM845: TM block 0x0c263000, sensor n
++ * status at 0xa0 + 4n, bits 11:0 signed tenths of a degree C, bit 21 valid;
++ * Linux tsens-v2.c; CPU sensors 1-4 and 7-10 per sdm845.dtsi) and lowers
++ * both clusters' speed above 60 C (to 30 % at once above 75 C), raising it
++ * again in steps below 50 C, never above g7perf. g7therm=0 turns it off.
++ *
++ * Sleep mode: g7_display_power(0), called when iOS turns the display off
++ * (SweetFramebuffer), drops both clusters to their lowest level and tells the
++ * touch driver to stop polling (g7_screen_on); g7_display_power(1) restores
++ * the speed and touch. Pressing Power no longer leaves 8 cores at full speed.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
+ void g7_perf_init(void);
+ 
++#define G7P_TSENS_TM    0x0c263000u
++#define G7P_TS_STATUS   0x0a0u
++#define G7P_HOT_C10     600     /* 60.0 C: start slowing down */
++#define G7P_VHOT_C10    750     /* 75.0 C: 30 % at once */
++#define G7P_COOL_C10    500     /* 50.0 C: speed back up */
++#define G7P_FLOOR_PCT   30u
++
++static const unsigned g7p_sensors[] = { 1, 2, 3, 4, 7, 8, 9, 10 };
++
++/* What the thermal guard needs per cluster: its registers and frequency table. */
++static struct {
++	vm_offset_t base;
++	unsigned n, top;
++	uint32_t khz[40];
++	unsigned level;
++} g7p_dom[2];
++static unsigned g7p_limit = 85, g7p_cap = 85;
++volatile int g7_screen_on = 1;
++void g7_display_power(int on);
++static int g7p_chan;
++
+ #define G7P_ENABLE      0x000u
+ #define G7P_LUT         0x110u
+ #define G7P_ROW         32u
+@@ -47,7 +85,7 @@ g7p_rd(vm_offset_t b, uint32_t off)
+ }
+ 
+ static void
+-g7p_domain(const char *name, uint32_t pa, unsigned pct)
++g7p_domain(unsigned slot, const char *name, uint32_t pa, unsigned pct)
+ {
+ 	vm_offset_t b = ml_io_map(pa, 0x1000);
+ 	if (!b) {
+@@ -85,6 +123,15 @@ g7p_domain(const char *name, uint32_t pa, unsigned pct)
+ 			pick = i;
+ 		}
+ 	}
++	if (slot < 2) {
++		g7p_dom[slot].base = b;
++		g7p_dom[slot].n = n;
++		g7p_dom[slot].top = top;
++		for (unsigned i = 0; i < n; i++) {
++			g7p_dom[slot].khz[i] = khz[i];
++		}
++		g7p_dom[slot].level = pick;
++	}
+ 	uint32_t before = g7p_rd(b, G7P_STATE), vote = g7p_rd(b, G7P_VOTE) & 0x3ffu;
+ 	__asm__ volatile ("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(b + G7P_STATE) = pick;
+@@ -95,6 +142,107 @@ g7p_domain(const char *name, uint32_t pa, unsigned pct)
+ 	(void)vote;
+ }
+ 
++/* Hottest valid CPU sensor in tenths of a degree C; -1000 when none reads. */
++static int
++g7p_hottest(vm_offset_t ts)
++{
++	int hot = -1000;
++	for (unsigned i = 0; i < sizeof(g7p_sensors) / sizeof(g7p_sensors[0]); i++) {
++		uint32_t st = g7p_rd(ts, G7P_TS_STATUS + 4u * g7p_sensors[i]);
++		if (!(st & (1u << 21))) {
++			continue;
++		}
++		int c10 = (int)(st & 0xfffu);
++		if (c10 & 0x800) {
++			c10 -= 0x1000;          /* 12-bit signed */
++		}
++		if (c10 > hot) {
++			hot = c10;
++		}
++	}
++	return hot;
++}
++
++/* Both clusters to the highest level at or below pct % of their top level. */
++static void
++g7p_apply(unsigned pct)
++{
++	for (unsigned d = 0; d < 2; d++) {
++		if (!g7p_dom[d].base || !g7p_dom[d].n) {
++			continue;
++		}
++		uint32_t want = (uint32_t)((uint64_t)g7p_dom[d].khz[g7p_dom[d].top] * pct / 100u);
++		unsigned pick = 0;
++		for (unsigned i = 0; i < g7p_dom[d].n; i++) {
++			if (g7p_dom[d].khz[i] && g7p_dom[d].khz[i] <= want && g7p_dom[d].khz[i] >= g7p_dom[d].khz[pick]) {
++				pick = i;
++			}
++		}
++		if (pick != g7p_dom[d].level) {
++			__asm__ volatile ("dmb oshst" ::: "memory");
++			*(volatile uint32_t *)(g7p_dom[d].base + G7P_STATE) = pick;
++			__asm__ volatile ("dsb osh" ::: "memory");
++			g7p_dom[d].level = pick;
++		}
++	}
++}
++
++/* Display power from SweetFramebuffer: sleep mode off/on. */
++void
++g7_display_power(int on)
++{
++	if (on == g7_screen_on) {
++		return;
++	}
++	g7_screen_on = on;
++	g7p_apply(on ? g7p_cap : 0);        /* 0 %: every level is above it, so level 0, the lowest */
++	printf("G7 PERF: display %s: %s\n", on ? "on" : "off", on ? "speed restored" : "sleep mode (lowest CPU speed)");
++}
++
++static void
++g7p_sleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&g7p_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++g7p_thermal(void *arg __unused, wait_result_t wr __unused)
++{
++	vm_offset_t ts = ml_io_map(G7P_TSENS_TM, 0x1000);
++	if (!ts) {
++		printf("G7 PERF: thermal sensors map failed; guard off\n");
++		(void)thread_terminate(current_thread());
++		return;
++	}
++	unsigned reports = 0;
++	for (;;) {
++		int hot = g7p_hottest(ts);
++		unsigned cap = g7p_cap;
++		if (hot >= G7P_VHOT_C10) {
++			cap = G7P_FLOOR_PCT;
++		} else if (hot >= G7P_HOT_C10) {
++			cap = cap > G7P_FLOOR_PCT + 10u ? cap - 10u : G7P_FLOOR_PCT;
++		} else if (hot > -1000 && hot < G7P_COOL_C10 && cap < g7p_limit) {
++			cap = cap + 5u < g7p_limit ? cap + 5u : g7p_limit;
++		}
++		if (cap != g7p_cap && !g7_screen_on) {
++			g7p_cap = cap;              /* asleep: stays at the lowest level; the cap applies on wake */
++		} else if (cap != g7p_cap) {
++			printf("G7 PERF: CPU %d.%d C -> speed %u %% (limit %u %%)\n", hot / 10, (hot < 0 ? -hot : hot) % 10,
++			    cap, g7p_limit);
++			g7p_cap = cap;
++			g7p_apply(cap);
++		} else if (reports < 5) {
++			printf("G7 PERF: CPU %d.%d C, speed %u %%\n", hot / 10, (hot < 0 ? -hot : hot) % 10, cap);
++			reports++;
++		}
++		g7p_sleep(2000);
++	}
++}
++
+ void
+ g7_perf_init(void)
+ {
+@@ -108,7 +256,14 @@ g7_perf_init(void)
+ 		pct = 100;
+ 	}
+ 	for (unsigned d = 0; d < sizeof(g7p_domains) / sizeof(g7p_domains[0]); d++) {
+-		g7p_domain(g7p_domains[d].name, g7p_domains[d].pa, pct);
++		g7p_domain(d, g7p_domains[d].name, g7p_domains[d].pa, pct);
++	}
++	g7p_limit = g7p_cap = pct;
++	unsigned therm = 1;
++	(void)PE_parse_boot_argn("g7therm", &therm, sizeof(therm));
++	thread_t t;
++	if (therm && kernel_thread_start(g7p_thermal, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
+ 	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_g7touch.c
++++ b/bsd/dev/sweet_g7touch.c
+@@ -29,6 +29,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern volatile int g7_screen_on;      /* g7_perf.c: 0 while iOS has the display off (sleep mode) */
+ void sweet_g7touch_init(void);
+ 
+ #define G7_SE_PA        0x00894000u     /* QUPv3 wrap0 SE5 */
+@@ -613,6 +614,44 @@ static const uint8_t g7_init_seq[8][6] = {
+ 	{0x6c, 0x03, 0x85, 0x01, 0x00, 0x00},
+ };
+ 
++/*
++ * Wake from sleep mode: the SW49410 drives the panel too (TDDI), so turning
++ * the display off and on can leave its touch side unconfigured, and touch
++ * stopped after a screen-off. Send the same start-up writes as at boot.
++ */
++static void
++g7_wake_init(unsigned do_init)
++{
++	unsigned bad = 0;
++	if (do_init == 1) {
++		static const uint32_t seq[5][2] = {
++			{0xFE1, 0x07}, {0xFE2, 0x01}, {0xC00, 0x01}, {0xC01, 0x01}, {0xC03, 0x181},
++		};
++		for (unsigned i = 0; i < 5 && !g7.dead; ++i) {
++			uint32_t a = seq[i][0], v = seq[i][1];
++			g7.tx[0] = (uint8_t)(0x40u | ((a >> 8) & 0x0fu));
++			g7.tx[1] = (uint8_t)a;
++			g7.tx[2] = (uint8_t)v;
++			g7.tx[3] = (uint8_t)(v >> 8);
++			g7.tx[4] = (uint8_t)(v >> 16);
++			g7.tx[5] = (uint8_t)(v >> 24);
++			if (g7_spi(6)) {
++				bad++;
++			}
++			g7_sleep(i == 4 ? 30 : 10);
++		}
++	} else if (do_init == 2) {
++		for (unsigned i = 0; i < 8 && !g7.dead; ++i) {
++			bcopy(g7_init_seq[i], g7.tx, 6);
++			if (g7_spi(6)) {
++				bad++;
++			}
++			g7_sleep(100);
++		}
++	}
++	printf("G7 TOUCH: display on, touch re-initialised (%u errors)\n", bad);
++}
++
+ static void
+ g7_thread(void *arg, wait_result_t result)
+ {
+@@ -793,7 +832,24 @@ g7_thread(void *arg, wait_result_t result)
+ 		g7_stage(6, bad ? G7_RED : G7_GREEN);
+ 	}
+ 	unsigned errors = 0, frames = 0, ticks = 0, shown = 0, alive_reports = 0;
++	bool asleep = false;
+ 	while (!g7.dead) {
++		if (!g7_screen_on) {
++			/* Sleep mode: no SPI polling while the display is off (the bit-banged reads keep a core busy). */
++			if (!asleep) {
++				g7_report(0, g7.x, g7.y);
++				asleep = true;
++				printf("G7 TOUCH: display off, polling paused\n");
++			}
++			g7_sleep(200);
++			continue;
++		}
++		if (asleep) {
++			asleep = false;
++			g7_sleep(150);          /* let the panel come back first */
++			g7_wake_init(do_init);
++			errors = 0;
++		}
+ 		err = g7_poll(&frames);
+ 		g7.stage[6] = err ? G7_RED : G7_GREEN;
+ 		g7_bar_draw();
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -51,6 +51,7 @@ extern "C" void sweet_g7touch_overlay(uintptr_t pixels, uint32_t stride, uint32_
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++extern "C" void g7_display_power(int on);     /* bsd/dev/g7_perf.c */
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -645,6 +646,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++			g7_display_power(off ? 0 : 1);   /* G7 sleep mode: CPU speed, touch polling */
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
