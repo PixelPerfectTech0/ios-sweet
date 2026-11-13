@@ -147,7 +147,7 @@
 +	} else {
 +		g7g_probe();
 +	}
-+	for (int i = 0; i < 12; i++) {
++	for (int i = 0; i < 60; i++) {
 +		printf("G7 GPU: %s\n", g7g.summary[0] ? g7g.summary : "no result");
 +		g7g_sleep(10000);
 +	}

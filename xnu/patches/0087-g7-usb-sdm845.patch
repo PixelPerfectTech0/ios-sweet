@@ -18,28 +18,44 @@
  };
  
  #define DWC3_PA                 0x0a600000
-@@ -73,6 +73,31 @@ usb_rd(vm_offset_t base, uint32_t off)
+@@ -65,6 +65,14 @@ static const struct {
+ #define QUSB2_PA                0x088e2000
+ #define QUSB2_SIZE              0x00000400
+ 
++static void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -73,6 +81,32 @@ usb_rd(vm_offset_t base, uint32_t off)
  	return v;
  }
  
 +/* G7: where the bring-up stopped, repeated so it can be read after boot. */
 +extern kern_return_t thread_terminate(thread_t);
 +static const char *usb_stage = "starting";
-+static vm_offset_t usb_status_dwc;
++static vm_offset_t usb_status_dwc, usb_status_phy;
 +static int usb_status_chan;
 +
 +static void
 +usb_status_thread(void *arg __unused, wait_result_t wr __unused)
 +{
-+	for (int i = 0; i < 18; i++) {
++	for (int i = 0; i < 60; i++) {
 +		uint64_t deadline;
 +		clock_interval_to_deadline(10000, NSEC_PER_MSEC, &deadline);
 +		(void)assert_wait_deadline(&usb_status_chan, THREAD_UNINT, deadline);
 +		thread_block(THREAD_CONTINUE_NULL);
 +		if (usb_status_dwc) {
-+			printf("SWEET USB: status [%s] DSTS 0x%08x DCTL 0x%08x GEVNTCOUNT 0x%08x\n", usb_stage,
-+			    usb_rd(usb_status_dwc, 0xc70c), usb_rd(usb_status_dwc, 0xc704),
-+			    usb_rd(usb_status_dwc, 0xc40c));
++			printf("SWEET USB: status [%s] DSTS 0x%08x DCTL 0x%08x GEVNTCOUNT 0x%08x PHY_PLL 0x%08x\n",
++			    usb_stage, usb_rd(usb_status_dwc, 0xc70c), usb_rd(usb_status_dwc, 0xc704),
++			    usb_rd(usb_status_dwc, 0xc40c),
++			    usb_status_phy ? usb_rd(usb_status_phy, 0x1a0) : 0xdeadu);
 +		} else {
 +			printf("SWEET USB: status [%s]\n", usb_stage);
 +		}
@@ -50,7 +66,7 @@
  void
  sweet_usb_probe(void)
  {
-@@ -85,8 +110,15 @@ sweet_usb_probe(void)
+@@ -85,13 +119,44 @@ sweet_usb_probe(void)
  	if (!enabled) {
  		return;
  	}
@@ -66,11 +82,40 @@
  		printf("SWEET USB: GCC map failed\n");
  		return;
  	}
-@@ -101,9 +133,12 @@ sweet_usb_probe(void)
+ 	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
++	if (!(gdscr & (1u << 31)) && enabled >= 2) {
++		/* G7: LG's bootloader collapsed the USB power domain. Power it up. */
++		int us = 0;
++		usb_wr(gcc, GCC_USB30_PRIM_GDSCR, gdscr & ~1u);
++		while (us < 20000 && !(usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & (1u << 31))) {
++			delay(10);
++			us += 10;
++		}
++		gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++		printf("SWEET USB: GDSC power-up -> 0x%08x after %d us\n", gdscr, us);
++		usb_stage = (gdscr & (1u << 31)) ? "power domain turned on" : "power domain would not turn on";
++	}
++	if ((gdscr & (1u << 31)) && enabled >= 2) {
++		/* Enable every branch the controller and PHY need (CLK_ENABLE). */
++		for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
++			uint32_t v = usb_rd(gcc, usb_cbcr[i].off);
++			if (v & CBCR_CLK_OFF) {
++				usb_wr(gcc, usb_cbcr[i].off, v | 1u);
++				for (int w = 0; w < 200 && (usb_rd(gcc, usb_cbcr[i].off) & CBCR_CLK_OFF); w++) {
++					delay(10);
++				}
++			}
++		}
++	}
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+ 		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
+ 		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
+@@ -101,9 +166,12 @@ sweet_usb_probe(void)
  	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
  	if (!clocks_on) {
  		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
-+		usb_stage = (gdscr & (1u << 31)) ? "USB clocks off" : "USB power domain off";
++		usb_stage = (gdscr & (1u << 31)) ? "USB clocks off (would not enable)" : "USB power domain off";
  		return;
  	}
  	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
@@ -79,7 +124,15 @@
  	if (dwc == 0) {
  		printf("SWEET USB: DWC3 map failed\n");
  		return;
-@@ -720,6 +755,7 @@ ud_event(uint32_t ev)
+@@ -127,6 +195,7 @@ sweet_usb_probe(void)
+ 	if (phy == 0) {
+ 		return;
+ 	}
++	usb_status_phy = phy;
+ 	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+ 	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+ 	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+@@ -720,6 +789,7 @@ ud_event(uint32_t ev)
  			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
  			    (1u << 8) | (1u << 10) | (1u << 25), 0);
  			printf("SWEET USB: connected, speed %u\n", speed);
@@ -87,7 +140,7 @@
  		} else if (type == 0) {
  			printf("SWEET USB: disconnect\n");
  		}
-@@ -857,6 +893,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -857,6 +927,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
  	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
  		printf("SWEET USB: no DMA memory\n");
@@ -95,7 +148,7 @@
  		return;
  	}
  	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
-@@ -919,6 +956,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -919,6 +990,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  		delay(1000);
  	}
  	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
