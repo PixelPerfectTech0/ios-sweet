@@ -95,7 +95,12 @@ jobs:
             -Dzstd=disabled -Dbuildtype=release -Db_ndebug=true
 
       - name: Build
-        run: ninja -C build -k 0 2>&1 | tee build.log | grep -E 'error|FAILED|warning: unused' | head -100; test "${PIPESTATUS[0]}" = 0
+        run: |
+          set +e
+          ninja -C build -k 0 > build.log 2>&1
+          rc=$?
+          grep -E 'error|FAILED' build.log | head -100
+          exit $rc
 
       - name: Collect
         if: always()
