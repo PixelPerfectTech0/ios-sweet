@@ -1,0 +1,101 @@
+name: metal-bridge-ios
+
+# metal2vulkan (GPL-2.0-or-later OR LGPL-3.0-or-later) with the AdrenoMetal bridge (MIT, UniXNU/AdrenoMetal)
+# as one static library for iOS 16 arm64: the Metal runtime the G7's Metal plugin will run on Turnip.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: metal-bridge-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  M2V_REPO: https://github.com/steelbrain/metal2vulkan
+  M2V_COMMIT: 555b13d57e09bff70996a88cff64f1275256d5cf
+  ADRENO_METAL_REPO: https://github.com/UniXNU/AdrenoMetal
+  ADRENO_METAL_COMMIT: 73d582fd4d5772b1f5fa83581a25077a16f2b6cd
+  IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 150
+    steps:
+      - name: Sources
+        run: |
+          git init -q m2v && git -C m2v remote add origin "$M2V_REPO"
+          git -C m2v fetch -q --depth 1 origin "$M2V_COMMIT" && git -C m2v checkout -q FETCH_HEAD
+          git init -q am && git -C am remote add origin "$ADRENO_METAL_REPO"
+          git -C am fetch -q --depth 1 origin "$ADRENO_METAL_COMMIT" && git -C am checkout -q FETCH_HEAD
+          git -C m2v log -1 --format='metal2vulkan %H %cd'
+          git -C am log -1 --format='AdrenoMetal %H %cd'
+
+      - name: Bridge patches
+        run: |
+          cd m2v
+          for p in 0002-resource-wait-storage-dependencies 0004-fold-constant-global-field-loads \
+                   0005-skip-draws-without-a-pipeline 0007-optional-shader-cache-directory \
+                   0009-patch-with-no-control-points 0011-two-plane-shadow-as-memory-lies 0016-refuse-rebinds \
+                   0017-heap-texture-size-a-multiple-of-its-alignment 0023-quality-of-service-on-ios \
+                   0032-shader-cache-touch-refused-once 0040-unixnu-runtime-on-development-555b13d5 \
+                   0041-compile-on-the-asking-thread; do
+            git apply "../am/bridge/patches/$p.patch" && echo "applied $p"
+          done
+
+      - name: Toolchains
+        run: |
+          brew install llvm || true
+          echo "LLVM_AS=$(brew --prefix llvm)/bin/llvm-as" >> "$GITHUB_ENV"
+          rustup toolchain install 1.98.0 --profile minimal --target aarch64-apple-ios || rustup toolchain install stable --profile minimal --target aarch64-apple-ios
+          rustup toolchain list
+
+      - name: Fixtures and manifest
+        run: |
+          mkdir -p out
+          "$LLVM_AS" -o out/runtime_examples.air m2v/crates/metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll
+          "$LLVM_AS" -o out/function_constant.air m2v/crates/metal2vulkan-validation/fixtures/public/kernel_function_constant_gate_fold.ll
+          "$LLVM_AS" -o out/scanout_convert.air am/shaders/scanout_convert.ll
+          W=$GITHUB_WORKSPACE
+          cat > out/Cargo.toml <<EOF
+          [package]
+          name = "adreno-metal-bridge"
+          version = "0.1.0"
+          edition = "2024"
+          [workspace]
+          [lib]
+          crate-type = ["staticlib"]
+          path = "$W/am/bridge/NativeMetalBridge.rs"
+          [dependencies]
+          metal2vulkan = { path = "$W/m2v/crates/metal2vulkan", features = ["ash"] }
+          metal2vulkan-runtime = { path = "$W/m2v/crates/metal2vulkan-runtime" }
+          libc = "0.2"
+          sha2 = { version = "0.10", features = ["asm"] }
+          [profile.release]
+          panic = "unwind"
+          debug = 1
+          lto = "fat"
+          codegen-units = 1
+          EOF
+          cat out/Cargo.toml
+
+      - name: Build (aarch64-apple-ios, iOS ${{ env.IPHONEOS_DEPLOYMENT_TARGET }})
+        run: |
+          TC=1.98.0; rustup run 1.98.0 rustc --version || TC=stable
+          export NMB_RUNTIME_ID=$(printf '%s' "$M2V_COMMIT g7" | shasum -a 256 | cut -c1-32)
+          export NMB_FIXTURE_AIR=$PWD/out/runtime_examples.air NMB_FC_AIR=$PWD/out/function_constant.air NMB_SCANOUT_AIR=$PWD/out/scanout_convert.air
+          set +e
+          cargo +$TC build --release --manifest-path out/Cargo.toml --target aarch64-apple-ios --target-dir target > out/build.log 2>&1
+          rc=$?
+          grep -E '^(error|warning: unused)|error\[' out/build.log | head -60
+          tail -20 out/build.log
+          cp target/aarch64-apple-ios/release/libadreno_metal_bridge.a out/ 2>/dev/null && ls -la out/*.a
+          exit $rc
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: metal-bridge-ios
+          path: |
+            out/*.a
+            out/build.log
