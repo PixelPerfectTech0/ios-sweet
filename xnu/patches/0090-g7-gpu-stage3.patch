@@ -985,7 +985,7 @@
  static void
  g7g_sleep(unsigned ms)
  {
-@@ -119,6 +309,727 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
+@@ -119,6 +309,816 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
  	return false;
  }
  
@@ -1133,6 +1133,51 @@
 +}
 +
 +/*
++ * The A630 parts of Linux's hw_init register setup: security window off,
++ * 64-bit addressing in every block, bus and cache ranges, CP queues. gmem_min
++ * places the 1 MiB GMEM window in the GPU address space (Linux: 1 MiB on
++ * A630; the full driver's kernel buffers sit at 1-3 MiB, so it uses 16 MiB).
++ */
++static void
++g7g_hw_init(uint64_t gmem_min)
++{
++	g7g_gpu_wr(G7G_SECVID_TSB_CNTL, 0);
++	g7g_gpu_wr64(G7G_SECVID_TSB_TRUSTED_BASE, 0);
++	g7g_gpu_wr(G7G_SECVID_TSB_TRUSTED_SIZE, 0);
++	static const uint32_t addr_mode[] = { 0x0842, 0x0c01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601,
++		                              0x0e00, 0xae01, 0xb601, 0xf810 };
++	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); i++) {
++		g7g_gpu_wr(addr_mode[i], 0x1);
++	}
++	g7g_gpu_wr(G7G_RBBM_VBIF_QOS, 0x3);
++	g7g_gpu_wr(G7G_VBIF_GATE_OFF_WRREQ_EN, 0x9);
++	g7g_gpu_wr64(G7G_UCHE_WRITE_RANGE_MAX, 0x0001ffffffffffc0ull);
++	g7g_gpu_wr64(G7G_UCHE_TRAP_BASE, 0x0001fffffffff000ull);
++	g7g_gpu_wr64(G7G_UCHE_WRITE_THRU_BASE, 0x0001fffffffff000ull);
++	g7g_gpu_wr64(G7G_UCHE_GMEM_RANGE_MIN, gmem_min);
++	g7g_gpu_wr64(G7G_UCHE_GMEM_RANGE_MAX, gmem_min + G7G_A630_GMEM_BYTES - 1u);
++	g7g_gpu_wr(G7G_UCHE_FILTER_CNTL, 0x804);
++	g7g_gpu_wr(G7G_UCHE_CACHE_WAYS, 0x4);
++	g7g_gpu_wr(G7G_CP_ROQ_THRESHOLDS_2, 0x010000c0);
++	g7g_gpu_wr(G7G_CP_ROQ_THRESHOLDS_1, 0x8040362c);
++	g7g_gpu_wr(G7G_CP_MEM_POOL_SIZE, 128);
++	g7g_gpu_wr(G7G_CP_AHB_CNTL, 0x1);
++	g7g_gpu_wr(G7G_RBBM_PERFCTR_CNTL, 0x1);
++	g7g_gpu_wr(G7G_RBBM_HANG_INT_CNTL, (1u << 30) | 0x1fffff);
++	g7g_gpu_wr(G7G_UCHE_CLIENT_PF, (1u << 7) | 0x1);
++}
++
++/* Ask the GMU to keep the GPU on (OOB GPU_SET), as hw_init does; true when acked. */
++static bool
++g7g_gpu_hold(uint32_t *info)
++{
++	g7g_gmu_wr(G7G_GMU_HOST2GMU_SET, 1u << G7G_OOB_GPU_SET);
++	bool held = g7g_gmu_wait(G7G_GMU_GMU2HOST_INFO, 1u << G7G_OOB_GPU_ACK, 1u << G7G_OOB_GPU_ACK, 200000, info);
++	g7g_gmu_wr(G7G_GMU_GMU2HOST_CLR, 1u << G7G_OOB_GPU_ACK);
++	return held;
++}
++
++/*
 + * Stage 6 (g7gpu=6): with GX on and the GPU SMMU letting physical addresses
 + * through, run the command processor once: the A630 parts of the Linux
 + * hw_init register setup (bus, cache ranges, ring), SQE microcode in
@@ -1164,40 +1209,12 @@
 +
 +	/* Keep the GPU on while it is set up. */
 +	uint32_t info = 0;
-+	g7g_gmu_wr(G7G_GMU_HOST2GMU_SET, 1u << G7G_OOB_GPU_SET);
-+	bool held = g7g_gmu_wait(G7G_GMU_GMU2HOST_INFO, 1u << G7G_OOB_GPU_ACK, 1u << G7G_OOB_GPU_ACK, 200000, &info);
-+	g7g_gmu_wr(G7G_GMU_GMU2HOST_CLR, 1u << G7G_OOB_GPU_ACK);
-+	if (!held) {
++	if (!g7g_gpu_hold(&info)) {
 +		snprintf(g7g.cp, sizeof(g7g.cp), "stage6: GMU did not ack GPU_SET (%#x)", info);
 +		return;
 +	}
 +
-+	/* Bus, security window and cache ranges (A630 values). */
-+	g7g_gpu_wr(G7G_SECVID_TSB_CNTL, 0);
-+	g7g_gpu_wr64(G7G_SECVID_TSB_TRUSTED_BASE, 0);
-+	g7g_gpu_wr(G7G_SECVID_TSB_TRUSTED_SIZE, 0);
-+	/* 64-bit addressing in every block: our memory is above 4 GiB. */
-+	static const uint32_t addr_mode[] = { 0x0842, 0x0c01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601,
-+		                              0x0e00, 0xae01, 0xb601, 0xf810 };
-+	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); i++) {
-+		g7g_gpu_wr(addr_mode[i], 0x1);
-+	}
-+	g7g_gpu_wr(G7G_RBBM_VBIF_QOS, 0x3);
-+	g7g_gpu_wr(G7G_VBIF_GATE_OFF_WRREQ_EN, 0x9);
-+	g7g_gpu_wr64(G7G_UCHE_WRITE_RANGE_MAX, 0x0001ffffffffffc0ull);
-+	g7g_gpu_wr64(G7G_UCHE_TRAP_BASE, 0x0001fffffffff000ull);
-+	g7g_gpu_wr64(G7G_UCHE_WRITE_THRU_BASE, 0x0001fffffffff000ull);
-+	g7g_gpu_wr64(G7G_UCHE_GMEM_RANGE_MIN, 0x100000ull);
-+	g7g_gpu_wr64(G7G_UCHE_GMEM_RANGE_MAX, 0x100000ull + G7G_A630_GMEM_BYTES - 1u);
-+	g7g_gpu_wr(G7G_UCHE_FILTER_CNTL, 0x804);
-+	g7g_gpu_wr(G7G_UCHE_CACHE_WAYS, 0x4);
-+	g7g_gpu_wr(G7G_CP_ROQ_THRESHOLDS_2, 0x010000c0);
-+	g7g_gpu_wr(G7G_CP_ROQ_THRESHOLDS_1, 0x8040362c);
-+	g7g_gpu_wr(G7G_CP_MEM_POOL_SIZE, 128);
-+	g7g_gpu_wr(G7G_CP_AHB_CNTL, 0x1);
-+	g7g_gpu_wr(G7G_RBBM_PERFCTR_CNTL, 0x1);
-+	g7g_gpu_wr(G7G_RBBM_HANG_INT_CNTL, (1u << 30) | 0x1fffff);
-+	g7g_gpu_wr(G7G_UCHE_CLIENT_PF, (1u << 7) | 0x1);
++	g7g_hw_init(0x100000ull);
 +
 +	/* Ring and microcode, then start the SQE. */
 +	g7g_gpu_wr64(G7G_CP_SQE_INSTR_BASE, sqe_pa);
@@ -1330,18 +1347,23 @@
 +	return rptr == g7g.ring_w;
 +}
 +
-+static void
-+g7g_stage7(void)
++/*
++ * Load LG's zap shader through TrustZone's PAS service (Linux qcom_mdt_load +
++ * qcom_scm_pas_auth_and_reset order). 0 when TrustZone accepted it; a message
++ * in g7g.zap otherwise.
++ */
++static int
++g7g_zap_load(void)
 +{
 +	if (!g7g.zap_pa || g7g.zap_size < 0x100 || g7g.zap_size > 0x10000) {
 +		snprintf(g7g.zap, sizeof(g7g.zap), "stage7: no zap image in the boot payload (G7Zap %#llx/%#llx)",
 +		    (unsigned long long)g7g.zap_pa, (unsigned long long)g7g.zap_size);
-+		return;
++		return -1;
 +	}
 +	vm_offset_t img = ml_io_map((vm_offset_t)g7g.zap_pa, (vm_size_t)g7g.zap_size);
 +	if (!img) {
 +		snprintf(g7g.zap, sizeof(g7g.zap), "stage7: zap map failed");
-+		return;
++		return -1;
 +	}
 +	const uint8_t *b = (const uint8_t *)img;
 +	uint32_t size = (uint32_t)g7g.zap_size;
@@ -1353,7 +1375,7 @@
 +	if (memcmp(b, "\177ELF", 4) || b[4] != 1 || phent != 32 || phnum == 0 || phnum > 8 ||
 +	    phoff + phnum * 32u > size) {
 +		snprintf(g7g.zap, sizeof(g7g.zap), "stage7: zap image is not the expected ELF32");
-+		return;
++		return -1;
 +	}
 +	uint32_t hdr_len = phoff + phnum * 32u, hash_off = 0, hash_len = 0;
 +	uint32_t load_off = 0, load_len = 0, load_mem = 0, load_pa = 0;
@@ -1374,7 +1396,7 @@
 +	    load_mem > G7G_ZAP_REGION_SIZE) {
 +		snprintf(g7g.zap, sizeof(g7g.zap), "stage7: zap layout unexpected (hash %#x+%#x load %#x+%#x/%#x)",
 +		    hash_off, hash_len, load_off, load_len, load_mem);
-+		return;
++		return -1;
 +	}
 +
 +	uint64_t supported = 0;
@@ -1387,7 +1409,7 @@
 +	uint8_t *md = IOMallocContiguous(0x4000, 0x1000, &md_pa);
 +	if (!md || !md_pa) {
 +		snprintf(g7g.zap, sizeof(g7g.zap), "stage7: metadata allocation failed");
-+		return;
++		return -1;
 +	}
 +	memcpy(md, b, hdr_len);
 +	memcpy(md + hdr_len, b + hash_off, hash_len);
@@ -1416,9 +1438,18 @@
 +	if (s_auth != 0) {
 +		snprintf(g7g.zap, sizeof(g7g.zap), "stage7: TrustZone refused the zap (init %lld, mem %lld, auth %lld)",
 +		    (long long)s_init, (long long)s_mem, (long long)s_auth);
-+		return;
++		return -1;
 +	}
 +
++	return 0;
++}
++
++static void
++g7g_stage7(void)
++{
++	if (g7g_zap_load()) {
++		return;
++	}
 +	/* Leave secure mode, then prove the CP still runs with a second marker. */
 +	uint32_t pk[6] = {
 +		g7g_pkt7(G7G_PM4_SET_SECURE_MODE, 1), 0,
@@ -1433,6 +1464,64 @@
 +	    "stage7: zap accepted, but the CP did not run the next packets (marker %#x, rptr %u/%u)",
 +	    seen, rptr, g7g.ring_w);
 +	(void)ran;
++}
++
++/*
++ * ---- Stage 8 exports: what the full driver (iokit/Kernel/arm/g7adreno/G7Adreno.cpp) uses ----
++ * The GMU stays ours (stages 2-4 boot it and power GX); the driver gets MMIO
++ * access, the A630 register setup, the zap loader and the SQE microcode.
++ */
++int g7_adreno_bringup(char *msg, size_t n);
++uint32_t g7_gpu_rd(uint32_t dword);
++void g7_gpu_wr(uint32_t dword, uint32_t v);
++int g7_gpu_prepare(uint64_t gmem_min);
++int g7_gpu_zap(void);
++const uint32_t *g7_gpu_sqe(uint32_t *words);
++vm_offset_t g7_gpu_smmu(void);
++
++uint32_t
++g7_gpu_rd(uint32_t dword)
++{
++	return g7g.gpu ? g7g_gpu_rd(dword) : 0xffffffffu;
++}
++
++void
++g7_gpu_wr(uint32_t dword, uint32_t v)
++{
++	if (g7g.gpu) {
++		g7g_gpu_wr(dword, v);
++	}
++}
++
++/* Hold the GPU on (OOB GPU_SET) and program the A630 register setup; 0 on success. */
++int
++g7_gpu_prepare(uint64_t gmem_min)
++{
++	uint32_t info = 0;
++	if (!g7g.gpu || !g7g_gpu_hold(&info)) {
++		return -1;
++	}
++	g7g_hw_init(gmem_min);
++	return 0;
++}
++
++int
++g7_gpu_zap(void)
++{
++	return g7g_zap_load();
++}
++
++const uint32_t *
++g7_gpu_sqe(uint32_t *words)
++{
++	*words = G7G_SQE_FW_WORDS;
++	return g7g_sqe_fw;
++}
++
++vm_offset_t
++g7_gpu_smmu(void)
++{
++	return ml_io_map(G7G_SMMU_PA, G7G_SMMU_SIZE);
 +}
 +
 +/* ---- RPMh command DB (read only) ---- */
@@ -1713,7 +1802,7 @@
  /*
   * Stage 2: the GPU's bus clocks, the CX power domain and the GMU clocks
   * (GMU core clock from the 19.2 MHz crystal: slow but needs no PLL), then
-@@ -184,6 +1095,28 @@ g7g_stage2(void)
+@@ -184,6 +1184,38 @@ g7g_stage2(void)
  	snprintf(g7g.summary, sizeof(g7g.summary),
  	    "stage2: CX on, GMU clocks on, GMU %s (counter %#x -> %#x), CM3 reset %#x",
  	    ao1 != ao2 ? "ALIVE" : "not counting", ao1, ao2, rst);
@@ -1722,6 +1811,16 @@
 +	}
 +	if (g7g.level >= 5) {
 +		g7g_smmu_report();
++	}
++	if (g7g.level >= 8) {
++		/* The full driver (G7Adreno.cpp) takes the GPU over: its own page tables, ring, zap and Metal service. */
++		if (!g7g.gx_ok) {
++			snprintf(g7g.cp, sizeof(g7g.cp), "stage8: skipped (GX not confirmed on)");
++		} else {
++			int rc = g7_adreno_bringup(g7g.cp, sizeof(g7g.cp));
++			printf("G7 GPU: stage8 full driver bring-up returned %d\n", rc);
++		}
++		return;
 +	}
 +	if (g7g.level >= 6) {
 +		if (!g7g.gx_ok) {
@@ -1742,7 +1841,7 @@
  }
  
  static void
-@@ -241,6 +1174,15 @@ g7g_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -241,6 +1273,15 @@ g7g_thread(void *arg __unused, wait_result_t wr __unused)
  	}
  	for (int i = 0; i < 60; i++) {
  		printf("G7 GPU: %s\n", g7g.summary[0] ? g7g.summary : "no result");
@@ -1758,7 +1857,7 @@
  		g7g_sleep(10000);
  	}
  	(void)thread_terminate(current_thread());
-@@ -254,6 +1196,15 @@ g7_gpu_init(void)
+@@ -254,6 +1295,15 @@ g7_gpu_init(void)
  	if (g7g.level == 0) {
  		return;
  	}
