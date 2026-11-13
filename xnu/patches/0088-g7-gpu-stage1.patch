@@ -10,7 +10,7 @@
  bsd/dev/unix_startup.c			standard
 --- /dev/null
 +++ b/bsd/dev/g7_gpu.c
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,261 @@
 +/*
 + * LG G7 ThinQ (SDM845): Adreno 630 bring-up, written for this port.
 + *
@@ -19,8 +19,10 @@
 + * GPU clock controller's (GPUCC) GMU clocks and CX/GX power domains.
 + * Nothing is written, and GPUCC is only read when its AHB clock is on (a
 + * read of an unclocked block can hang the bus).
-+ * Stage 2 (g7gpu=2): also turns the GPUCC AHB clock on (one GCC enable bit)
-+ * so GPUCC can be read.
++ * Stage 2 (g7gpu=2): turns on the GPU's bus clocks, the CX power domain and
++ * the GMU clocks (from the crystal), then checks that the GMU answers.
++ * (On the G7 the bootloader leaves all of it off; stage 1 found the AHB
++ * clock on and everything else off.)
 + *
 + * Offsets: Linux drivers/clk/qcom/gcc-sdm845.c and gpucc-sdm845.c
 + * (register facts only). Bit layout: a branch control register (CBCR) has
@@ -59,9 +61,18 @@
 +
 +#define G7G_OFF             (1u << 31)
 +
++/* GMU window: registers are dword offsets from the GPU base 0x05000000. */
++#define G7G_GPU_PA          0x05000000u
++#define G7G_GMU_PA          0x0506a000u
++#define G7G_GMU_SIZE        0x00030000u
++#define G7G_GMU_CM3_SYSRESET        0x1f800u
++#define G7G_GMU_CM3_FW_INIT_RESULT  0x1f81cu
++#define G7G_GMU_AO_COUNTER_L        0x1f888u
++#define G7G_GMU_SPTPRAC_STATUS      0x1f8d0u
++
 +static int g7g_chan;
 +static struct {
-+	vm_offset_t gcc, gpucc;
++	vm_offset_t gcc, gpucc, gmu;
 +	unsigned level;
 +	char summary[160];
 +} g7g;
@@ -82,6 +93,12 @@
 +	__asm__ volatile ("dsb osh" ::: "memory");
 +}
 +
++static uint32_t
++g7g_gmu_rd(uint32_t dword)
++{
++	return g7g_rd(g7g.gmu, dword * 4u - (G7G_GMU_PA - G7G_GPU_PA));
++}
++
 +static void
 +g7g_sleep(unsigned ms)
 +{
@@ -95,6 +112,91 @@
 +g7g_on(uint32_t cbcr)
 +{
 +	return (cbcr & G7G_OFF) ? "off" : "on";
++}
++
++/* Turn one GCC/GPUCC branch on (CLK_ENABLE) and wait for CLK_OFF to clear. */
++static bool
++g7g_branch_on(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = g7g_rd(base, off);
++	if (!(v & G7G_OFF)) {
++		return true;
++	}
++	g7g_wr(base, off, v | 1u);
++	for (int i = 0; i < 500; i++) {
++		if (!(g7g_rd(base, off) & G7G_OFF)) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++/*
++ * Stage 2: the GPU's bus clocks, the CX power domain and the GMU clocks
++ * (GMU core clock from the 19.2 MHz crystal: slow but needs no PLL), then
++ * read-only checks that the GMU block answers. The GMU's always-on counter
++ * runs from the crystal, so two reads that differ prove the block is alive.
++ */
++static void
++g7g_stage2(void)
++{
++	bool memnoc = g7g_branch_on(g7g.gcc, G7G_GCC_GPU_MEMNOC);
++	bool snoc = g7g_branch_on(g7g.gcc, G7G_GCC_GPU_SNOC);
++	g7g_wr(g7g.gcc, G7G_GCC_VOTE, g7g_rd(g7g.gcc, G7G_GCC_VOTE) | (1u << 15) | (1u << 16));
++	printf("G7 GPU: stage2 memnoc %s snoc_dvm %s gpll0 vote %#x\n", memnoc ? "on" : "FAILED",
++	    snoc ? "on" : "FAILED", g7g_rd(g7g.gcc, G7G_GCC_VOTE));
++
++	/* CX GDSC (votable: status in GDS_HW_CTRL bit 31): clear SW_COLLAPSE. */
++	uint32_t cx = g7g_rd(g7g.gpucc, G7G_CX_GDSCR);
++	g7g_wr(g7g.gpucc, G7G_CX_GDSCR, cx & ~1u);
++	int us = 0;
++	while (us < 20000 && !(g7g_rd(g7g.gpucc, G7G_CX_GDS_HW_CTRL) & (1u << 31)) &&
++	    !(g7g_rd(g7g.gpucc, G7G_CX_GDSCR) & (1u << 31))) {
++		delay(10);
++		us += 10;
++	}
++	cx = g7g_rd(g7g.gpucc, G7G_CX_GDSCR);
++	uint32_t hw = g7g_rd(g7g.gpucc, G7G_CX_GDS_HW_CTRL);
++	bool cx_on = ((cx | hw) & (1u << 31)) != 0;
++	printf("G7 GPU: stage2 CX gdsc %#x hwctl %#x after %d us -> %s\n", cx, hw, us, cx_on ? "ON" : "off");
++	if (!cx_on) {
++		snprintf(g7g.summary, sizeof(g7g.summary), "stage2: CX power domain would not turn on");
++		return;
++	}
++
++	/* GMU clock source: crystal (source 0), no divider; then latch it. */
++	g7g_wr(g7g.gpucc, G7G_GMU_RCG + 4u, 0);
++	g7g_wr(g7g.gpucc, G7G_GMU_RCG, g7g_rd(g7g.gpucc, G7G_GMU_RCG) | 1u);
++	for (int i = 0; i < 500 && (g7g_rd(g7g.gpucc, G7G_GMU_RCG) & 1u); i++) {
++		delay(10);
++	}
++	bool cxo = g7g_branch_on(g7g.gpucc, G7G_CXO_CBCR);
++	bool gmuclk = g7g_branch_on(g7g.gpucc, G7G_CX_GMU_CBCR);
++	printf("G7 GPU: stage2 gmu_rcg %#x/%#x cxo %s cx_gmu %s\n", g7g_rd(g7g.gpucc, G7G_GMU_RCG),
++	    g7g_rd(g7g.gpucc, G7G_GMU_RCG + 4u), cxo ? "on" : "FAILED", gmuclk ? "on" : "FAILED");
++	if (!cxo || !gmuclk) {
++		snprintf(g7g.summary, sizeof(g7g.summary), "stage2: CX on, but GMU clocks would not start");
++		return;
++	}
++
++	/* GMU registers: GPU base + dword offset * 4 (Mesa a6xx_gmu.xml). */
++	g7g.gmu = ml_io_map(G7G_GMU_PA, G7G_GMU_SIZE);
++	if (!g7g.gmu) {
++		snprintf(g7g.summary, sizeof(g7g.summary), "stage2: GMU map failed");
++		return;
++	}
++	uint32_t ao1 = g7g_gmu_rd(G7G_GMU_AO_COUNTER_L);
++	delay(1000);
++	uint32_t ao2 = g7g_gmu_rd(G7G_GMU_AO_COUNTER_L);
++	uint32_t init = g7g_gmu_rd(G7G_GMU_CM3_FW_INIT_RESULT);
++	uint32_t rst = g7g_gmu_rd(G7G_GMU_CM3_SYSRESET);
++	uint32_t sptp = g7g_gmu_rd(G7G_GMU_SPTPRAC_STATUS);
++	printf("G7 GPU: stage2 GMU always-on %#x -> %#x, cm3 sysreset %#x fw_init %#x sptprac %#x\n",
++	    ao1, ao2, rst, init, sptp);
++	snprintf(g7g.summary, sizeof(g7g.summary),
++	    "stage2: CX on, GMU clocks on, GMU %s (counter %#x -> %#x), CM3 reset %#x",
++	    ao1 != ao2 ? "ALIVE" : "not counting", ao1, ao2, rst);
 +}
 +
 +static void
@@ -135,6 +237,9 @@
 +	    "stage1: CX power %s, GX power %s, GMU clock %s, CXO clock %s",
 +	    (cx & G7G_OFF) ? "ON" : "off", (gx & G7G_OFF) ? "ON" : "off",
 +	    g7g_on(gmu), g7g_on(cxo));
++	if (g7g.level >= 2) {
++		g7g_stage2();
++	}
 +}
 +
 +static void
