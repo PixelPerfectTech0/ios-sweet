@@ -1,0 +1,105 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -51,13 +51,13 @@ static const struct {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
++	{ "master", 0x0f00c },      /* SDM845 offsets (Linux gcc-sdm845.c) */
++	{ "sleep", 0x0f010 },
++	{ "utmi", 0x0f014 },
+ 	{ "cfg-noc-axi", 0x0502c },
+ 	{ "aggre-axi", 0x8201c },
+ 	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	{ "clkref", 0x8c008 },
+ };
+ 
+ #define DWC3_PA                 0x0a600000
+@@ -73,6 +73,31 @@ usb_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++/* G7: where the bring-up stopped, repeated so it can be read after boot. */
++extern kern_return_t thread_terminate(thread_t);
++static const char *usb_stage = "starting";
++static vm_offset_t usb_status_dwc;
++static int usb_status_chan;
++
++static void
++usb_status_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (int i = 0; i < 18; i++) {
++		uint64_t deadline;
++		clock_interval_to_deadline(10000, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&usb_status_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		if (usb_status_dwc) {
++			printf("SWEET USB: status [%s] DSTS 0x%08x DCTL 0x%08x GEVNTCOUNT 0x%08x\n", usb_stage,
++			    usb_rd(usb_status_dwc, 0xc70c), usb_rd(usb_status_dwc, 0xc704),
++			    usb_rd(usb_status_dwc, 0xc40c));
++		} else {
++			printf("SWEET USB: status [%s]\n", usb_stage);
++		}
++	}
++	(void)thread_terminate(current_thread());
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -85,8 +110,15 @@ sweet_usb_probe(void)
+ 	if (!enabled) {
+ 		return;
+ 	}
++	{
++		thread_t st;
++		if (kernel_thread_start(usb_status_thread, NULL, &st) == KERN_SUCCESS) {
++			thread_deallocate(st);
++		}
++	}
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
++		usb_stage = "GCC map failed";
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
+@@ -101,9 +133,12 @@ sweet_usb_probe(void)
+ 	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
+ 	if (!clocks_on) {
+ 		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
++		usb_stage = (gdscr & (1u << 31)) ? "USB clocks off" : "USB power domain off";
+ 		return;
+ 	}
+ 	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	usb_status_dwc = dwc;
++	usb_stage = enabled >= 2 ? "controller read, starting gadget" : "report only (sweetusb=1)";
+ 	if (dwc == 0) {
+ 		printf("SWEET USB: DWC3 map failed\n");
+ 		return;
+@@ -720,6 +755,7 @@ ud_event(uint32_t ev)
+ 			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
+ 			    (1u << 8) | (1u << 10) | (1u << 25), 0);
+ 			printf("SWEET USB: connected, speed %u\n", speed);
++			usb_stage = "connected to host";
+ 		} else if (type == 0) {
+ 			printf("SWEET USB: disconnect\n");
+ 		}
+@@ -857,6 +893,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET USB: no DMA memory\n");
++		usb_stage = "no DMA memory";
+ 		return;
+ 	}
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
+@@ -919,6 +956,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		delay(1000);
+ 	}
+ 	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
++	usb_stage = "gadget running, waiting for host";
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}

@@ -1,0 +1,187 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_g7touch.c			standard
++bsd/dev/g7_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/g7_gpu.c
+@@ -0,0 +1,156 @@
++/*
++ * LG G7 ThinQ (SDM845): Adreno 630 bring-up, written for this port.
++ *
++ * Stage 1 (boot-arg g7gpu=1): read-only. Reports what the bootloader left
++ * powered and clocked for the GPU: the GCC branches that feed it and the
++ * GPU clock controller's (GPUCC) GMU clocks and CX/GX power domains.
++ * Nothing is written, and GPUCC is only read when its AHB clock is on (a
++ * read of an unclocked block can hang the bus).
++ * Stage 2 (g7gpu=2): also turns the GPUCC AHB clock on (one GCC enable bit)
++ * so GPUCC can be read.
++ *
++ * Offsets: Linux drivers/clk/qcom/gcc-sdm845.c and gpucc-sdm845.c
++ * (register facts only). Bit layout: a branch control register (CBCR) has
++ * CLK_OFF in bit 31; a GDSC control register has PWR_ON in bit 31.
++ * Output lines start with "G7 GPU:" and repeat for a while after boot so
++ * they can be read on the panel.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void g7_gpu_init(void);
++
++#define G7G_GCC_PA          0x00100000u
++#define G7G_GCC_SIZE        0x00080000u
++#define G7G_GCC_GPU_CFG_AHB 0x71004u    /* gcc_gpu_cfg_ahb_clk: GPUCC register access */
++#define G7G_GCC_GPU_MEMNOC  0x7100cu    /* gcc_gpu_memnoc_gfx_clk */
++#define G7G_GCC_GPU_SNOC    0x71018u    /* gcc_gpu_snoc_dvm_gfx_clk */
++#define G7G_GCC_VOTE        0x52004u    /* bits 15/16: gpll0 / gpll0_div to the GPU */
++
++#define G7G_GPUCC_PA        0x05090000u
++#define G7G_GPUCC_SIZE      0x00002000u
++#define G7G_CX_GDSCR        0x106cu
++#define G7G_GX_GDSCR        0x100cu
++#define G7G_CX_GMU_CBCR     0x1098u
++#define G7G_CXO_CBCR        0x109cu
++#define G7G_GMU_RCG         0x1120u
++#define G7G_CX_GDS_HW_CTRL  0x1540u
++
++#define G7G_OFF             (1u << 31)
++
++static int g7g_chan;
++static struct {
++	vm_offset_t gcc, gpucc;
++	unsigned level;
++	char summary[160];
++} g7g;
++
++static uint32_t
++g7g_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++g7g_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++g7g_sleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&g7g_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static const char *
++g7g_on(uint32_t cbcr)
++{
++	return (cbcr & G7G_OFF) ? "off" : "on";
++}
++
++static void
++g7g_probe(void)
++{
++	uint32_t ahb = g7g_rd(g7g.gcc, G7G_GCC_GPU_CFG_AHB);
++	uint32_t memnoc = g7g_rd(g7g.gcc, G7G_GCC_GPU_MEMNOC);
++	uint32_t snoc = g7g_rd(g7g.gcc, G7G_GCC_GPU_SNOC);
++	uint32_t vote = g7g_rd(g7g.gcc, G7G_GCC_VOTE);
++
++	printf("G7 GPU: gcc cfg_ahb %#x (%s) memnoc %#x (%s) snoc_dvm %#x (%s) gpll0 vote %u/%u\n",
++	    ahb, g7g_on(ahb), memnoc, g7g_on(memnoc), snoc, g7g_on(snoc),
++	    (vote >> 15) & 1u, (vote >> 16) & 1u);
++	if ((ahb & G7G_OFF) && g7g.level >= 2) {
++		g7g_wr(g7g.gcc, G7G_GCC_GPU_CFG_AHB, ahb | 1u);
++		for (int i = 0; i < 200 && (g7g_rd(g7g.gcc, G7G_GCC_GPU_CFG_AHB) & G7G_OFF); i++) {
++			delay(10);
++		}
++		ahb = g7g_rd(g7g.gcc, G7G_GCC_GPU_CFG_AHB);
++		printf("G7 GPU: cfg_ahb enabled -> %#x (%s)\n", ahb, g7g_on(ahb));
++	}
++	if (ahb & G7G_OFF) {
++		snprintf(g7g.summary, sizeof(g7g.summary),
++		    "stage1: GPU AHB clock off (bootloader left GPU unclocked); g7gpu=2 turns it on");
++		return;
++	}
++	g7g.gpucc = ml_io_map(G7G_GPUCC_PA, G7G_GPUCC_SIZE);
++	if (!g7g.gpucc) {
++		snprintf(g7g.summary, sizeof(g7g.summary), "stage1: GPUCC map failed");
++		return;
++	}
++	uint32_t cx = g7g_rd(g7g.gpucc, G7G_CX_GDSCR), gx = g7g_rd(g7g.gpucc, G7G_GX_GDSCR);
++	uint32_t gmu = g7g_rd(g7g.gpucc, G7G_CX_GMU_CBCR), cxo = g7g_rd(g7g.gpucc, G7G_CXO_CBCR);
++	uint32_t rcg = g7g_rd(g7g.gpucc, G7G_GMU_RCG), rcgcfg = g7g_rd(g7g.gpucc, G7G_GMU_RCG + 4u);
++	printf("G7 GPU: gpucc CX gdsc %#x GX gdsc %#x cx_gmu %#x cxo %#x gmu_rcg %#x/%#x hwctl %#x\n",
++	    cx, gx, gmu, cxo, rcg, rcgcfg, g7g_rd(g7g.gpucc, G7G_CX_GDS_HW_CTRL));
++	snprintf(g7g.summary, sizeof(g7g.summary),
++	    "stage1: CX power %s, GX power %s, GMU clock %s, CXO clock %s",
++	    (cx & G7G_OFF) ? "ON" : "off", (gx & G7G_OFF) ? "ON" : "off",
++	    g7g_on(gmu), g7g_on(cxo));
++}
++
++static void
++g7g_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	g7g_sleep(25000);       /* after the boot scroll */
++	g7g.gcc = ml_io_map(G7G_GCC_PA, G7G_GCC_SIZE);
++	if (!g7g.gcc) {
++		printf("G7 GPU: GCC map failed\n");
++	} else {
++		g7g_probe();
++	}
++	for (int i = 0; i < 12; i++) {
++		printf("G7 GPU: %s\n", g7g.summary[0] ? g7g.summary : "no result");
++		g7g_sleep(10000);
++	}
++	(void)thread_terminate(current_thread());
++}
++
++void
++g7_gpu_init(void)
++{
++	thread_t t;
++	(void)PE_parse_boot_argn("g7gpu", &g7g.level, sizeof(g7g.level));
++	if (g7g.level == 0) {
++		return;
++	}
++	if (kernel_thread_start(g7g_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_g7touch_init(void);
++extern void g7_gpu_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -662,6 +663,7 @@ sweet_ufs_init(void)
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
+ 	sweet_g7touch_init();
++	g7_gpu_init();          /* G7 Adreno 630, off unless g7gpu=N */
+ 	return 0;
+ }
+ 
