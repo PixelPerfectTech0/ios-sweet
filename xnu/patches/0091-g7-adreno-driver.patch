@@ -2337,7 +2337,7 @@
 +	const unsigned sids[2] = {0x0, 0x1};
 +	NativeAdrenoGmuContextReport report{};
 +	IOReturn r = NativeAdrenoGpuContextBringupRoutes(reinterpret_cast<volatile uint8_t *>(smmu), 0x10000, bank, 1,
-+	    slots, sids, 2, progress, &report);
++	    slots, sids, 1, progress, &report);   /* stream 0 only: diag9 SMR for SID 1 read back 0 (want 0x80000001) */
 +	IOLog("G7 GPU: stage8 SMMU bank %u slots %u/%u: %#x step %u program %u route %u ias %u oas %u\n", bank,
 +	    slots[0], slots[1], r, report.step, report.program_status, report.route_status,
 +	    NativeAdrenoGpuContextInputBits(), report.output_bits);
