@@ -987,7 +987,7 @@
  static void
  g7g_sleep(unsigned ms)
  {
-@@ -119,6 +311,829 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
+@@ -119,6 +311,835 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
  	return false;
  }
  
@@ -1500,8 +1500,14 @@
 +g7_gpu_prepare(uint64_t gmem_min)
 +{
 +	uint32_t info = 0;
-+	if (!g7g.gpu || !g7g_gpu_hold(&info)) {
++	if (!g7g.gpu) {
 +		return -1;
++	}
++	/* The G7's GMU never acks GPU_SET (it acks BOOT_SLUMBER; no HFI queues yet). GX is already powered and
++	 * answers (stage4 write test), and idle power collapse is off (PWR_COL_FRAME_CTRL), so go on without
++	 * the hold rather than stop here. */
++	if (!g7g_gpu_hold(&info)) {
++		printf("G7 GPU: stage8 GPU_SET not acked (%#x); continuing, GX stays on (no idle collapse)\n", info);
 +	}
 +	g7g_hw_init(gmem_min);
 +	return 0;
@@ -1817,7 +1823,7 @@
  /*
   * Stage 2: the GPU's bus clocks, the CX power domain and the GMU clocks
   * (GMU core clock from the 19.2 MHz crystal: slow but needs no PLL), then
-@@ -184,6 +1199,44 @@ g7g_stage2(void)
+@@ -184,6 +1205,44 @@ g7g_stage2(void)
  	snprintf(g7g.summary, sizeof(g7g.summary),
  	    "stage2: CX on, GMU clocks on, GMU %s (counter %#x -> %#x), CM3 reset %#x",
  	    ao1 != ao2 ? "ALIVE" : "not counting", ao1, ao2, rst);
@@ -1862,7 +1868,7 @@
  }
  
  static void
-@@ -229,6 +1282,14 @@ g7g_probe(void)
+@@ -229,6 +1288,14 @@ g7g_probe(void)
  	}
  }
  
@@ -1877,7 +1883,7 @@
  static void
  g7g_thread(void *arg __unused, wait_result_t wr __unused)
  {
-@@ -241,6 +1302,15 @@ g7g_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -241,6 +1308,15 @@ g7g_thread(void *arg __unused, wait_result_t wr __unused)
  	}
  	for (int i = 0; i < 60; i++) {
  		printf("G7 GPU: %s\n", g7g.summary[0] ? g7g.summary : "no result");
@@ -1893,7 +1899,7 @@
  		g7g_sleep(10000);
  	}
  	(void)thread_terminate(current_thread());
-@@ -254,6 +1324,15 @@ g7_gpu_init(void)
+@@ -254,6 +1330,15 @@ g7_gpu_init(void)
  	if (g7g.level == 0) {
  		return;
  	}
