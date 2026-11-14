@@ -933,7 +933,7 @@
 +	vm_offset_t gcc, gpucc, gmu, pdc, pdcseq, db, gpu;
 +	uint32_t db_size;
 +	char smmu[160];
-+	char cp[160];
++	char cp[320];
 +	char zap[160];
 +	bool gx_ok, smmu_bypass, cp_ok;
 +	uint64_t zap_pa, zap_size;      /* from /chosen/memory-map G7Zap, read at init */

@@ -1823,7 +1823,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,599 @@
+@@ -0,0 +1,615 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -2004,6 +2004,8 @@
 + * SMMU v2 global space): slots whose SMR valid bit is clear, a bank no valid
 + * S2CR translates to.
 + */
++static uint32_t gPickId0, gPickWas[2], gPickNow[2], gPickSmr[2], gPickClash;
++
 +bool
 +pick_smmu(volatile uint8_t *s, unsigned slots[2], unsigned *bank)
 +{
@@ -2027,17 +2029,29 @@
 +	}
 +	/* The core leases only slots parked as FAULT (S2CR type 2, no bank); firmware leaves unused
 +	 * slots as bypass or translate-to-0. They match no stream, so parking them changes nothing. */
++	gPickId0 = id0;
 +	for (unsigned k = 0; k < found; k++) {
 +		const uint32_t at = 0xc00u + 4u * slots[k], was = rd(at);
++		gPickWas[k] = was;
 +		if ((was & ~(1u << 10)) != (2u << 16)) {
 +			wr(at, 2u << 16);
 +			__asm__ volatile("dsb sy" ::: "memory");
 +			IOLog("G7 GPU: stage8 SMMU slot %u S2CR %#x -> FAULT (%#x)\n", slots[k], was, rd(at));
 +		}
++		gPickNow[k] = rd(at);
++		gPickSmr[k] = rd(0x800u + 4u * slots[k]);
 +	}
 +	for (unsigned b = 0; b < ncb && b < 32; b++) {
 +		if (!(banks_used & (1u << b))) {
 +			*bank = b;
++			/* any live slot (valid SMR or EXIDS valid S2CR) whose S2CR names this bank, whatever its type */
++			gPickClash = 0;
++			for (unsigned i = 0; i < nsmr && i < 128; i++) {
++				const uint32_t c = rd(0xc00u + 4u * i);
++				if ((c & 0xffu) == b && (exids ? (c & (1u << 10)) : (rd(0x800u + 4u * i) & (1u << 31)))) {
++					gPickClash = 0x100u | i;
++				}
++			}
 +			return found == 2;
 +		}
 +	}
@@ -2315,8 +2329,10 @@
 +	    slots[0], slots[1], r, report.step, report.program_status, report.route_status,
 +	    NativeAdrenoGpuContextInputBits(), report.output_bits);
 +	if (r) {
-+		G7_FAIL("stage8: GPU SMMU context failed at step %u (%#x, program %u, route %u)", report.step, r,
-+		    report.program_status, report.route_status);
++		G7_FAIL("stage8: GPU SMMU context failed at step %u (%#x, program %u, route %u phase %u) id0 %#x bank %u "
++		    "slot %u smr %#x s2cr %#x->%#x, slot %u smr %#x s2cr %#x->%#x, clash %#x",
++		    report.step, r, report.program_status, report.route_status, report.route_phase, gPickId0, bank,
++		    slots[0], gPickSmr[0], gPickWas[0], gPickNow[0], slots[1], gPickSmr[1], gPickWas[1], gPickNow[1], gPickClash);
 +	}
 +	gProgMsg = nullptr;
 +	snprintf(msg, n, "stage8: HUNG or still in: context buffers");
