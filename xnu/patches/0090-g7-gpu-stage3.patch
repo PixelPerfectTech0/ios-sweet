@@ -987,7 +987,7 @@
  static void
  g7g_sleep(unsigned ms)
  {
-@@ -119,6 +311,835 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
+@@ -119,6 +311,842 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
  	return false;
  }
  
@@ -1367,8 +1367,15 @@
 +		snprintf(g7g.zap, sizeof(g7g.zap), "stage7: zap map failed");
 +		return -1;
 +	}
-+	const uint8_t *b = (const uint8_t *)img;
++	/* The payload is mapped as Device memory, where memcpy's wide unaligned loads take an alignment fault
++	 * (diag11 panic in g7g_zap_load). Copy it byte by byte into normal memory and parse that copy. */
++	static uint8_t zap_copy[0x10000];
 +	uint32_t size = (uint32_t)g7g.zap_size;
++	const volatile uint8_t *src = (const volatile uint8_t *)img;
++	for (uint32_t i = 0; i < size; i++) {
++		zap_copy[i] = src[i];
++	}
++	const uint8_t *b = zap_copy;
 +	/* ELF32: header, program headers, hash segment, one relocatable load segment. */
 +	uint32_t phoff = 0, phnum = 0, phent = 0;
 +	memcpy(&phoff, b + 0x1c, 4);
@@ -1823,7 +1830,7 @@
  /*
   * Stage 2: the GPU's bus clocks, the CX power domain and the GMU clocks
   * (GMU core clock from the 19.2 MHz crystal: slow but needs no PLL), then
-@@ -184,6 +1205,44 @@ g7g_stage2(void)
+@@ -184,6 +1212,44 @@ g7g_stage2(void)
  	snprintf(g7g.summary, sizeof(g7g.summary),
  	    "stage2: CX on, GMU clocks on, GMU %s (counter %#x -> %#x), CM3 reset %#x",
  	    ao1 != ao2 ? "ALIVE" : "not counting", ao1, ao2, rst);
@@ -1868,7 +1875,7 @@
  }
  
  static void
-@@ -229,6 +1288,14 @@ g7g_probe(void)
+@@ -229,6 +1295,14 @@ g7g_probe(void)
  	}
  }
  
@@ -1883,7 +1890,7 @@
  static void
  g7g_thread(void *arg __unused, wait_result_t wr __unused)
  {
-@@ -241,6 +1308,15 @@ g7g_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -241,6 +1315,15 @@ g7g_thread(void *arg __unused, wait_result_t wr __unused)
  	}
  	for (int i = 0; i < 60; i++) {
  		printf("G7 GPU: %s\n", g7g.summary[0] ? g7g.summary : "no result");
@@ -1899,7 +1906,7 @@
  		g7g_sleep(10000);
  	}
  	(void)thread_terminate(current_thread());
-@@ -254,6 +1330,15 @@ g7_gpu_init(void)
+@@ -254,6 +1337,15 @@ g7_gpu_init(void)
  	if (g7g.level == 0) {
  		return;
  	}
