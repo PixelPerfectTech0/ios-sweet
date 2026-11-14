@@ -1597,7 +1597,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/ArmSmmu4KStreams.c
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,162 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "ArmSmmu4KStreams.h"
 +#define FAULT (UINT32_C(2)<<16)
@@ -1624,6 +1624,9 @@
 +    if((r->scr0&0x407)!=0x406 || !!(r->scr0&8)!=exids(r->id0))return ArmSmmu4KStateMismatch;
 +    return r->global_fault?ArmSmmu4KFault:ArmSmmu4KSuccess;
 +}
++uint32_t g7_scan_why[4];   /* G7: check (1 own slot not FAULT, 2 own slot live with other SID, 3 other slot translates to bank), slot, smr, s2cr */
++static ArmSmmu4KStatus g7_busy(unsigned why,unsigned slot,uint32_t smr,uint32_t s2cr)
++{g7_scan_why[0]=why;g7_scan_why[1]=slot;g7_scan_why[2]=smr;g7_scan_why[3]=s2cr;return ArmSmmu4KBusy;}
 +static ArmSmmu4KStatus scan(const ArmSmmu4KIo *io,const ArmSmmu4KStream *s,unsigned n,
 +    unsigned bank,unsigned attached,ArmSmmu4KStreamResult *r)
 +{
@@ -1642,11 +1645,11 @@
 +            unsigned live=valid(r->id0,smr,s2cr);
 +            if(attached) {
 +                if(smr!=(valid_smr(r->id0)|s[own].sid) || s2cr!=(bank|valid_s2cr(r->id0)))return ArmSmmu4KStateMismatch;
-+            } else if(!is_fault(s2cr,valid_s2cr(r->id0)) ||
-+                (live && smr!=(valid_smr(r->id0)|s[own].sid)))return ArmSmmu4KBusy;
++            } else if(!is_fault(s2cr,valid_s2cr(r->id0)))return g7_busy(1,slot,smr,s2cr);
++            else if(live && smr!=(valid_smr(r->id0)|s[own].sid))return g7_busy(2,slot,smr,s2cr);
 +            ++r->streams_verified;
 +        } else if(valid(r->id0,smr,s2cr)) {
-+            if(!(s2cr&(3u<<16)) && (s2cr&255)==bank)return ArmSmmu4KBusy;
++            if(!(s2cr&(3u<<16)) && (s2cr&255)==bank)return g7_busy(3,slot,smr,s2cr);
 +            uint32_t mask=(smr>>16)&(exids(r->id0)?0xffffu:0x7fffu),id=smr&0xffff;
 +            for(unsigned i=0;i<n;++i)if(!((s[i].sid^id)&~mask&sidmask))return ArmSmmu4KOverlap;
 +        }
@@ -1825,7 +1828,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,625 @@
+@@ -0,0 +1,628 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1988,6 +1991,8 @@
 +	IODelay(20);
 +	return 0;
 +}
++
++extern "C" uint32_t g7_scan_why[4];   /* ArmSmmu4KStreams.c (G7 diagnostics) */
 +
 +static char *gProgMsg;
 +static size_t gProgLen;
@@ -2342,9 +2347,10 @@
 +	    NativeAdrenoGpuContextInputBits(), report.output_bits);
 +	if (r) {
 +		G7_FAIL("stage8: GPU SMMU context failed at step %u (%#x, program %u, route %u phase %u) id0 %#x bank %u "
-+		    "slot %u smr %#x s2cr %#x->%#x, slot %u smr %#x s2cr %#x->%#x, clash %#x, probe %#x",
++		    "slot %u smr %#x s2cr %#x->%#x, slot %u smr %#x s2cr %#x->%#x, clash %#x, probe %#x, why %u slot %u smr %#x s2cr %#x",
 +		    report.step, r, report.program_status, report.route_status, report.route_phase, gPickId0, bank,
-+		    slots[0], gPickSmr[0], gPickWas[0], gPickNow[0], slots[1], gPickSmr[1], gPickWas[1], gPickNow[1], gPickClash, gPickProbe);
++		    slots[0], gPickSmr[0], gPickWas[0], gPickNow[0], slots[1], gPickSmr[1], gPickWas[1], gPickNow[1], gPickClash, gPickProbe,
++		    g7_scan_why[0], g7_scan_why[1], g7_scan_why[2], g7_scan_why[3]);
 +	}
 +	gProgMsg = nullptr;
 +	snprintf(msg, n, "stage8: HUNG or still in: context buffers");
