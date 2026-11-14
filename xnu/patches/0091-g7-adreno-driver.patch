@@ -1597,7 +1597,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/ArmSmmu4KStreams.c
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,159 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "ArmSmmu4KStreams.h"
 +#define FAULT (UINT32_C(2)<<16)
@@ -1608,6 +1608,8 @@
 +static unsigned exids(uint32_t id){return (id>>8)&1;}
 +static uint32_t valid_smr(uint32_t id){return exids(id)?0:UINT32_C(1)<<31;}
 +static uint32_t valid_s2cr(uint32_t id){return exids(id)?1u<<10:0;}
++/* G7: CBNDX of a FAULT entry is ignored (MMU-500 here reads it back as 0xff). */
++static int is_fault(uint32_t v,uint32_t valid_bit){return (v&~(valid_bit|255u))==FAULT;}
 +static int valid(uint32_t id,uint32_t smr,uint32_t s2cr)
 +{return exids(id)?!!(s2cr&(1u<<10)):!!(smr&(UINT32_C(1)<<31));}
 +static ArmSmmu4KStatus global(const ArmSmmu4KIo *io,ArmSmmu4KStreamResult *r)
@@ -1640,7 +1642,7 @@
 +            unsigned live=valid(r->id0,smr,s2cr);
 +            if(attached) {
 +                if(smr!=(valid_smr(r->id0)|s[own].sid) || s2cr!=(bank|valid_s2cr(r->id0)))return ArmSmmu4KStateMismatch;
-+            } else if((s2cr&~valid_s2cr(r->id0))!=FAULT ||
++            } else if(!is_fault(s2cr,valid_s2cr(r->id0)) ||
 +                (live && smr!=(valid_smr(r->id0)|s[own].sid)))return ArmSmmu4KBusy;
 +            ++r->streams_verified;
 +        } else if(valid(r->id0,smr,s2cr)) {
@@ -1671,10 +1673,10 @@
 +         * an old or corrupted SID from an initially invalid slot. */
 +        size_t smr=0x800+4*state->streams[i].slot;
 +        uint32_t match=valid_smr(state->id0)|state->streams[i].sid;
-+        if(wr(io,at,FAULT,r) || io->barrier(io->cookie) || rd(io,at,&value,r) || value!=FAULT ||
++        if(wr(io,at,FAULT,r) || io->barrier(io->cookie) || rd(io,at,&value,r) || !is_fault(value,0) ||
 +            wr(io,smr,match,r) || io->barrier(io->cookie) || rd(io,smr,&value,r) || value!=match ||
 +            wr(io,at,FAULT|valid_s2cr(state->id0),r) || io->barrier(io->cookie) ||
-+            rd(io,at,&value,r) || value!=(FAULT|valid_s2cr(state->id0)))failed=1;
++            rd(io,at,&value,r) || !is_fault(value,0) || (value&valid_s2cr(state->id0))!=valid_s2cr(state->id0))failed=1;
 +        else ++r->streams_faulted;
 +    }
 +    return failed;
@@ -1823,7 +1825,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,615 @@
+@@ -0,0 +1,625 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -2004,7 +2006,7 @@
 + * SMMU v2 global space): slots whose SMR valid bit is clear, a bank no valid
 + * S2CR translates to.
 + */
-+static uint32_t gPickId0, gPickWas[2], gPickNow[2], gPickSmr[2], gPickClash;
++static uint32_t gPickId0, gPickWas[2], gPickNow[2], gPickSmr[2], gPickClash, gPickProbe;
 +
 +bool
 +pick_smmu(volatile uint8_t *s, unsigned slots[2], unsigned *bank)
@@ -2033,13 +2035,23 @@
 +	for (unsigned k = 0; k < found; k++) {
 +		const uint32_t at = 0xc00u + 4u * slots[k], was = rd(at);
 +		gPickWas[k] = was;
-+		if ((was & ~(1u << 10)) != (2u << 16)) {
++		if ((was & ~((1u << 10) | 0xffu)) != (2u << 16)) {   /* CBNDX of a FAULT entry reads back 0xff here */
 +			wr(at, 2u << 16);
 +			__asm__ volatile("dsb sy" ::: "memory");
 +			IOLog("G7 GPU: stage8 SMMU slot %u S2CR %#x -> FAULT (%#x)\n", slots[k], was, rd(at));
 +		}
 +		gPickNow[k] = rd(at);
 +		gPickSmr[k] = rd(0x800u + 4u * slots[k]);
++	}
++	/* Do S2CR writes reach the hardware? The slot's SMR is invalid, so a brief translate entry matches nothing. */
++	if (found) {
++		const uint32_t at = 0xc00u + 4u * slots[0], keep = rd(at);
++		wr(at, 0x1u);
++		__asm__ volatile("dsb sy" ::: "memory");
++		gPickProbe = rd(at);
++		wr(at, keep);
++		__asm__ volatile("dsb sy" ::: "memory");
++		IOLog("G7 GPU: stage8 S2CR write probe: wrote 0x1, read %#x\n", gPickProbe);
 +	}
 +	for (unsigned b = 0; b < ncb && b < 32; b++) {
 +		if (!(banks_used & (1u << b))) {
@@ -2330,9 +2342,9 @@
 +	    NativeAdrenoGpuContextInputBits(), report.output_bits);
 +	if (r) {
 +		G7_FAIL("stage8: GPU SMMU context failed at step %u (%#x, program %u, route %u phase %u) id0 %#x bank %u "
-+		    "slot %u smr %#x s2cr %#x->%#x, slot %u smr %#x s2cr %#x->%#x, clash %#x",
++		    "slot %u smr %#x s2cr %#x->%#x, slot %u smr %#x s2cr %#x->%#x, clash %#x, probe %#x",
 +		    report.step, r, report.program_status, report.route_status, report.route_phase, gPickId0, bank,
-+		    slots[0], gPickSmr[0], gPickWas[0], gPickNow[0], slots[1], gPickSmr[1], gPickWas[1], gPickNow[1], gPickClash);
++		    slots[0], gPickSmr[0], gPickWas[0], gPickNow[0], slots[1], gPickSmr[1], gPickWas[1], gPickNow[1], gPickClash, gPickProbe);
 +	}
 +	gProgMsg = nullptr;
 +	snprintf(msg, n, "stage8: HUNG or still in: context buffers");
