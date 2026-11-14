@@ -1597,7 +1597,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/ArmSmmu4KStreams.c
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,165 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "ArmSmmu4KStreams.h"
 +#define FAULT (UINT32_C(2)<<16)
@@ -1621,9 +1621,12 @@
 +     * policy (USFCFG). Configuration-access fault reporting (GCFGFRE/GCFGFIE) is not required: Linux sets
 +     * it only in its own global reset, and firmware that owns sCR0 may leave it clear (an Adreno SMMU read
 +     * 0x002f0406). It reports bad register accesses, it does not change translation or bypass. */
-+    if((r->scr0&0x407)!=0x406 || !!(r->scr0&8)!=exids(r->id0))return ArmSmmu4KStateMismatch;
++    if((r->scr0&0x407)!=0x406 || !!(r->scr0&8)!=exids(r->id0))return g7_mismatch(1,0,r->id0,r->scr0);
 +    return r->global_fault?ArmSmmu4KFault:ArmSmmu4KSuccess;
 +}
++uint32_t g7_mm[4];   /* G7: mismatch (1 sCR0, 2 attached slot, 3 id0/sCR0 changed, 5 S2CR write, 6 SMR write), slot, expected, read */
++static ArmSmmu4KStatus g7_mismatch(unsigned why,unsigned slot,uint32_t want,uint32_t got)
++{g7_mm[0]=why;g7_mm[1]=slot;g7_mm[2]=want;g7_mm[3]=got;return ArmSmmu4KStateMismatch;}
 +uint32_t g7_scan_why[4];   /* G7: check (1 own slot not FAULT, 2 own slot live with other SID, 3 other slot translates to bank), slot, smr, s2cr */
 +static ArmSmmu4KStatus g7_busy(unsigned why,unsigned slot,uint32_t smr,uint32_t s2cr)
 +{g7_scan_why[0]=why;g7_scan_why[1]=slot;g7_scan_why[2]=smr;g7_scan_why[3]=s2cr;return ArmSmmu4KBusy;}
@@ -1644,7 +1647,7 @@
 +        if(own<n) {
 +            unsigned live=valid(r->id0,smr,s2cr);
 +            if(attached) {
-+                if(smr!=(valid_smr(r->id0)|s[own].sid) || s2cr!=(bank|valid_s2cr(r->id0)))return ArmSmmu4KStateMismatch;
++                if(smr!=(valid_smr(r->id0)|s[own].sid) || s2cr!=(bank|valid_s2cr(r->id0)))return g7_mismatch(2,slot,smr,s2cr);
 +            } else if(!is_fault(s2cr,valid_s2cr(r->id0)))return g7_busy(1,slot,smr,s2cr);
 +            else if(live && smr!=(valid_smr(r->id0)|s[own].sid))return g7_busy(2,slot,smr,s2cr);
 +            ++r->streams_verified;
@@ -1688,7 +1691,7 @@
 +    const ArmSmmu4KContextConfig *c,ArmSmmu4KStreamResult *r)
 +{
 +    ArmSmmu4KStatus status=global(io,r);if(status)return status;
-+    if(r->id0!=s->id0 || r->scr0!=s->scr0)return ArmSmmu4KStateMismatch;
++    if(r->id0!=s->id0 || r->scr0!=s->scr0)return g7_mismatch(3,0,s->scr0,r->scr0);
 +    status=ArmSmmu4KObserveOwnedContext(io,s->bank,c,&r->context);if(status)return status;
 +    status=scan(io,s->streams,s->count,s->bank,1,r);if(status)return status;
 +    return io->barrier(io->cookie)?ArmSmmu4KIoError:ArmSmmu4KSuccess;
@@ -1708,7 +1711,7 @@
 +    *r=(ArmSmmu4KStreamResult){0};r->must_retain_resources=1;
 +    if(!s || !s->attached || s->poisoned || !s->count || s->count>8)return ArmSmmu4KArgument;
 +    ArmSmmu4KStatus status=global(io,r);if(status)return status;
-+    if(r->id0!=s->id0 || r->scr0!=s->scr0)return ArmSmmu4KStateMismatch;
++    if(r->id0!=s->id0 || r->scr0!=s->scr0)return g7_mismatch(3,0,s->scr0,r->scr0);
 +    status=ArmSmmu4KObserveOwnedContext(io,s->bank,c,&r->context);if(status)return status;
 +    for(unsigned i=0;i<s->count;++i) {
 +        uint32_t smr,s2cr;
@@ -1737,9 +1740,9 @@
 +        /* In EXIDS mode make this leased slot invalid until its new SID is
 +         * installed. All masters are quiesced, and unmatched SIDs fault. */
 +        if(wr(io,s2cr,bank,r) || io->barrier(io->cookie) || rd(io,s2cr,&value,r)) {status=ArmSmmu4KIoError;goto failed;}
-+        if(value!=bank){status=ArmSmmu4KStateMismatch;goto failed;}
++        if(value!=bank){status=g7_mismatch(5,s[i].slot,bank,value);goto failed;}
 +        if(wr(io,smr,valid_smr(r->id0)|s[i].sid,r) || io->barrier(io->cookie) || rd(io,smr,&value,r)) {status=ArmSmmu4KIoError;goto failed;}
-+        if(value!=(valid_smr(r->id0)|s[i].sid)){status=ArmSmmu4KStateMismatch;goto failed;}
++        if(value!=(valid_smr(r->id0)|s[i].sid)){status=g7_mismatch(6,s[i].slot,valid_smr(r->id0)|s[i].sid,value);goto failed;}
 +        if(exids(r->id0) && (wr(io,s2cr,bank|valid_s2cr(r->id0),r) || io->barrier(io->cookie))) {status=ArmSmmu4KIoError;goto failed;}
 +    }
 +    r->phase=3;status=observe(io,state,c,r);if(status)goto failed;
@@ -1754,7 +1757,7 @@
 +    *r=(ArmSmmu4KStreamResult){0};r->must_retain_resources=1;
 +    if(!s || !s->attached || s->poisoned || !s->count || s->count>8)return ArmSmmu4KArgument;
 +    ArmSmmu4KStatus status=global(io,r);if(status)return status;
-+    if(r->id0!=s->id0 || r->scr0!=s->scr0)return ArmSmmu4KStateMismatch;
++    if(r->id0!=s->id0 || r->scr0!=s->scr0)return g7_mismatch(3,0,s->scr0,r->scr0);
 +    status=scan(io,s->streams,s->count,s->bank,1,r);if(status)return status;
 +    r->phase=6;
 +    if(quarantine(io,s,s->count,r)){s->poisoned=1;s->attached=0;return ArmSmmu4KIoError;}
@@ -1992,7 +1995,7 @@
 +	return 0;
 +}
 +
-+extern "C" uint32_t g7_scan_why[4];   /* ArmSmmu4KStreams.c (G7 diagnostics) */
++extern "C" uint32_t g7_scan_why[4], g7_mm[4];   /* ArmSmmu4KStreams.c (G7 diagnostics) */
 +
 +static char *gProgMsg;
 +static size_t gProgLen;
@@ -2339,10 +2342,10 @@
 +	    NativeAdrenoGpuContextInputBits(), report.output_bits);
 +	if (r) {
 +		G7_FAIL("stage8: GPU SMMU context failed at step %u (%#x, program %u, route %u phase %u) id0 %#x bank %u "
-+		    "slot %u smr %#x s2cr %#x->%#x, slot %u smr %#x s2cr %#x->%#x, clash %#x, probe %#x, why %u slot %u smr %#x s2cr %#x",
++		    "slot %u smr %#x s2cr %#x->%#x, slot %u smr %#x s2cr %#x->%#x, clash %#x, why %u slot %u smr %#x s2cr %#x, mm %u slot %u want %#x got %#x",
 +		    report.step, r, report.program_status, report.route_status, report.route_phase, gPickId0, bank,
-+		    slots[0], gPickSmr[0], gPickWas[0], gPickNow[0], slots[1], gPickSmr[1], gPickWas[1], gPickNow[1], gPickClash, gPickProbe,
-+		    g7_scan_why[0], g7_scan_why[1], g7_scan_why[2], g7_scan_why[3]);
++		    slots[0], gPickSmr[0], gPickWas[0], gPickNow[0], slots[1], gPickSmr[1], gPickWas[1], gPickNow[1], gPickClash,
++		    g7_scan_why[0], g7_scan_why[1], g7_scan_why[2], g7_scan_why[3], g7_mm[0], g7_mm[1], g7_mm[2], g7_mm[3]);
 +	}
 +	gProgMsg = nullptr;
 +	snprintf(msg, n, "stage8: HUNG or still in: context buffers");
