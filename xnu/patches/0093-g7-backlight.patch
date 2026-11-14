@@ -1,0 +1,365 @@
+--- a/bsd/dev/g7_perf.c
++++ b/bsd/dev/g7_perf.c
+@@ -58,6 +58,7 @@ static struct {
+ static unsigned g7p_limit = 85, g7p_cap = 85;
+ volatile int g7_screen_on = 1;
+ void g7_display_power(int on);
++void g7_backlight_power(int on);      /* iokit/Kernel/arm/G7Backlight.cpp */
+ static int g7p_chan;
+ 
+ #define G7P_ENABLE      0x000u
+@@ -195,6 +196,7 @@ g7_display_power(int on)
+ 		return;
+ 	}
+ 	g7_screen_on = on;
++	g7_backlight_power(on);         /* LCD backlight off while the display is off */
+ 	g7p_apply(on ? g7p_cap : 0);        /* 0 %: every level is above it, so level 0, the lowest */
+ 	printf("G7 PERF: display %s: %s\n", on ? "on" : "off", on ? "speed restored" : "sleep mode (lowest CPU speed)");
+ }
+--- /dev/null
++++ b/iokit/Kernel/arm/G7Backlight.cpp
+@@ -0,0 +1,316 @@
++/*
++ * LG G7 backlight (g7bl=1, default): an AppleARMBacklight service, the class
++ * iOS CoreBrightness looks for, publishing IODisplayParameters.brightness
++ * (0..65536). Brightness set by iOS (the Control Center / Settings slider)
++ * goes to the PMI8998 WLED sinks (SPMI SID 3, peripheral 0xd9) that light the
++ * G7's LCD; g7_backlight_power() turns them off while the display is off.
++ *
++ * PMIC writes are limited to the WLED sink brightness and sync registers
++ * (0xd947, 0xd957/58, 0xd967/68, 0xd977/78), and only when the SPMI arbiter
++ * says the apps processor owns that peripheral. Register layout from the
++ * PMI8998 WLED4 description (sink base 0xd900, 12-bit brightness per string,
++ * sync toggle after an update).
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <pexpert/pexpert.h>
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern "C" void g7_backlight_power(int on);
++
++#define BL_CORE_PA   0x0c440000u
++#define BL_CFG_PA    0x0c40a000u
++#define BL_OBS_PA    0x0e600000u
++#define BL_CHNLS_PA  0x0c600000u
++#define BL_SID       3u
++#define BL_SINK      0xd9u
++#define BL_SYNC      0x47u
++#define BL_BRIGHT(n) (0x57u + 0x10u * (n))
++#define BL_STRINGS   3u
++#define BL_MAX       4095u
++#define BL_FLOOR     16u                  /* WLED4 works down to 0.4 % */
++#define BL_IOS_MAX   65536u
++
++static vm_offset_t bl_obs, bl_wr;         /* observer (read) and RW channel of the sink's APID */
++static IOLock *bl_lock;
++static bool bl_ready, bl_power = true;
++static uint32_t bl_level = 2048;          /* WLED value for "display on" */
++
++static uint32_t
++bl_rd32(vm_offset_t b, unsigned off)
++{
++	uint32_t v = *(volatile uint32_t *)(b + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static int
++bl_wait(vm_offset_t ch)
++{
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t st = bl_rd32(ch, 0x08u);
++		if (st & 1u) {
++			return (st & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
++	bl_ready = false;                     /* a late completion must not race a new command */
++	return -1;
++}
++
++static int
++bl_read(unsigned reg, uint8_t *out)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)bl_obs = (1u << 27) | ((reg & 0xffu) << 4);    /* EXT_READL, 1 byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	if (bl_wait(bl_obs)) {
++		return -1;
++	}
++	*out = (uint8_t)bl_rd32(bl_obs, 0x18u);
++	return 0;
++}
++
++static int
++bl_write(unsigned reg, uint8_t v)
++{
++	if (!bl_ready || (reg != BL_SYNC && !(reg >= BL_BRIGHT(0) && reg <= BL_BRIGHT(BL_STRINGS - 1) + 1u &&
++	    ((reg - BL_BRIGHT(0)) & 0x0fu) <= 1u))) {
++		return -1;
++	}
++	*(volatile uint32_t *)(bl_wr + 0x10u) = v;                           /* WDATA0 */
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)bl_wr = ((reg & 0xffu) << 4);                  /* EXT_WRITEL, 1 byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	return bl_wait(bl_wr);
++}
++
++/* Write one 12-bit level to every string, then pulse sync so the sinks take it. */
++static void
++bl_apply(uint32_t v)
++{
++	if (!bl_ready) {
++		return;
++	}
++	if (v > BL_MAX) {
++		v = BL_MAX;
++	}
++	for (unsigned s = 0; s < BL_STRINGS; s++) {
++		bl_write(BL_BRIGHT(s), (uint8_t)(v & 0xffu));
++		bl_write(BL_BRIGHT(s) + 1u, (uint8_t)(v >> 8));
++	}
++	bl_write(BL_SYNC, 0x00);
++	bl_write(BL_SYNC, 0x0f);
++}
++
++static bool
++bl_init(void)
++{
++	vm_offset_t core = ml_io_map(BL_CORE_PA, 0x2000), cfg = ml_io_map(BL_CFG_PA, 0x1000);
++	if (!core || !cfg) {
++		return false;
++	}
++	uint32_t ver = bl_rd32(core, 0), count = bl_rd32(core, 4) & 0x7ffu;
++	if (ver < 0x50000000u || ver >= 0x70000000u || !count || count > 512) {
++		IOLog("G7 BACKLIGHT: unsupported SPMI arbiter %#x\n", ver);
++		return false;
++	}
++	unsigned ppid = (BL_SID << 8) | BL_SINK, apid = 0xffff;
++	for (unsigned i = 0; i < count; i++) {
++		uint32_t m = bl_rd32(core, 0x900u + 4u * i);
++		if (m && ((m >> 8) & 0xfffu) == ppid) {
++			apid = i;
++			if ((bl_rd32(cfg, 0x700u + 4u * i) & 7u) == 0) {
++				break;
++			}
++		}
++	}
++	if (apid == 0xffff) {
++		IOLog("G7 BACKLIGHT: WLED sink not on the SPMI bus\n");
++		return false;
++	}
++	uint32_t owner = bl_rd32(cfg, 0x700u + 4u * apid) & 7u;
++	if (owner != 0) {
++		IOLog("G7 BACKLIGHT: WLED sink APID %u owned by EE %u, not ours\n", apid, owner);
++		return false;
++	}
++	bl_obs = ml_io_map(BL_OBS_PA + 0x80u * apid, 0x80);
++	bl_wr = ml_io_map(BL_CHNLS_PA + 0x10000u * apid, 0x100);
++	if (!bl_obs || !bl_wr) {
++		return false;
++	}
++	bl_ready = true;
++	uint8_t lo = 0, hi = 0;
++	if (!bl_read(BL_BRIGHT(0), &lo) && !bl_read(BL_BRIGHT(0) + 1u, &hi)) {
++		uint32_t cur = ((uint32_t)hi << 8 | lo) & BL_MAX;
++		if (cur >= BL_FLOOR) {
++			bl_level = cur;
++		}
++	}
++	IOLog("G7 BACKLIGHT: WLED sink APID %u, boot level %u/%u\n", apid, bl_level, BL_MAX);
++	return true;
++}
++
++/* iOS level 0..65536 -> WLED, squared so the low half of the slider stays usable. */
++static uint32_t
++bl_from_ios(uint64_t v)
++{
++	if (v > BL_IOS_MAX) {
++		v = BL_IOS_MAX;
++	}
++	uint64_t sq = v * v / BL_IOS_MAX;           /* 0..65536 */
++	return BL_FLOOR + (uint32_t)(sq * (BL_MAX - BL_FLOOR) / BL_IOS_MAX);
++}
++
++static uint64_t
++bl_to_ios(uint32_t w)
++{
++	if (w <= BL_FLOOR) {
++		return 0;
++	}
++	uint64_t sq = (uint64_t)(w - BL_FLOOR) * BL_IOS_MAX / (BL_MAX - BL_FLOOR);
++	uint64_t r = 0;
++	while ((r + 1) * (r + 1) <= sq * BL_IOS_MAX) {
++		r += 64;
++	}
++	while (r && r * r > sq * BL_IOS_MAX) {
++		r--;
++	}
++	return r > BL_IOS_MAX ? BL_IOS_MAX : r;
++}
++
++extern "C" void
++g7_backlight_power(int on)
++{
++	if (!bl_lock) {
++		return;
++	}
++	IOLockLock(bl_lock);
++	bl_power = on != 0;
++	bl_apply(bl_power ? bl_level : 0);
++	IOLockUnlock(bl_lock);
++}
++
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight)
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++private:
++	unsigned fLogged;
++	void publish(uint64_t value);
++	bool find(OSDictionary *d, uint64_t *out, unsigned depth);
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService)
++
++void
++AppleARMBacklight::publish(uint64_t value)
++{
++	OSDictionary *b = OSDictionary::withCapacity(3), *p = OSDictionary::withCapacity(1);
++	OSNumber *mn = OSNumber::withNumber(0ull, 32), *mx = OSNumber::withNumber(BL_IOS_MAX, 32),
++	    *v = OSNumber::withNumber(value, 32);
++	if (b && p && mn && mx && v) {
++		b->setObject("min", mn);
++		b->setObject("max", mx);
++		b->setObject("value", v);
++		p->setObject("brightness", b);
++		setProperty("IODisplayParameters", p);
++	}
++	OSSafeReleaseNULL(b);
++	OSSafeReleaseNULL(p);
++	OSSafeReleaseNULL(mn);
++	OSSafeReleaseNULL(mx);
++	OSSafeReleaseNULL(v);
++}
++
++bool
++AppleARMBacklight::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	uint32_t on = 1;
++	(void)PE_parse_boot_argn("g7bl", &on, sizeof(on));
++	if (!on) {
++		IOLog("G7 BACKLIGHT: off (g7bl=0)\n");
++		return false;
++	}
++	bl_lock = IOLockAlloc();
++	if (!bl_lock || !bl_init()) {
++		IOLog("G7 BACKLIGHT: not started\n");
++		return false;
++	}
++	setProperty("backlight-control", true);
++	setProperty("G7Backlight", "PMI8998 WLED");
++	publish(bl_to_ios(bl_level));
++	registerService();
++	return true;
++}
++
++/* A number, or a {value[, min, max]} dictionary, under a brightness key (also nested in IODisplayParameters). */
++bool
++AppleARMBacklight::find(OSDictionary *d, uint64_t *out, unsigned depth)
++{
++	OSObject *o = d->getObject("brightness");
++	OSNumber *n = OSDynamicCast(OSNumber, o);
++	if (n) {
++		*out = n->unsigned64BitValue();
++		return true;
++	}
++	OSDictionary *bd = OSDynamicCast(OSDictionary, o);
++	if (bd && (n = OSDynamicCast(OSNumber, bd->getObject("value")))) {
++		uint64_t v = n->unsigned64BitValue(), lo = 0, hi = BL_IOS_MAX;
++		OSNumber *a = OSDynamicCast(OSNumber, bd->getObject("min")), *b = OSDynamicCast(OSNumber, bd->getObject("max"));
++		if (a) {
++			lo = a->unsigned64BitValue();
++		}
++		if (b && b->unsigned64BitValue() > lo) {
++			hi = b->unsigned64BitValue();
++		}
++		v = v <= lo ? 0 : (v - lo) * BL_IOS_MAX / (hi - lo);
++		*out = v;
++		return true;
++	}
++	OSDictionary *p = OSDynamicCast(OSDictionary, d->getObject("IODisplayParameters"));
++	return p && depth == 0 && find(p, out, 1);
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (!d) {
++		return kIOReturnBadArgument;
++	}
++	if (fLogged < 20) {
++		fLogged++;
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++		OSString *k;
++		char keys[160];
++		int at = 0;
++		keys[0] = 0;
++		while (it && (k = OSDynamicCast(OSString, it->getNextObject())) && at < (int)sizeof(keys) - 2) {
++			at += snprintf(keys + at, sizeof(keys) - (size_t)at, "%s%s", at ? "," : "", k->getCStringNoCopy());
++		}
++		OSSafeReleaseNULL(it);
++		IOLog("G7 BACKLIGHT: set {%s}\n", keys);
++	}
++	uint64_t v = 0;
++	if (!find(d, &v, 0)) {
++		return kIOReturnSuccess;              /* other keys (auto-brightness, commit, ...) accepted */
++	}
++	IOLockLock(bl_lock);
++	bl_level = bl_from_ios(v);
++	if (bl_power) {
++		bl_apply(bl_level);
++	}
++	IOLockUnlock(bl_lock);
++	publish(v > BL_IOS_MAX ? BL_IOS_MAX : v);
++	return kIOReturnSuccess;
++}
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -63,6 +63,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = IOCoreSurfaceRoot;"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleARMBacklight;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleARMBacklight;"
++    "   },"
++    "   {"
+     "     'IOClass'         = G7AdrenoAccelerator;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = G7AdrenoAccelerator;"
+--- a/iokit/conf/Makefile.template
++++ b/iokit/conf/Makefile.template
+@@ -264,3 +264,4 @@ NativeAdrenoSubmit.cpo_CXXWARNFLAGS_ADD += -w
+ NativeAdrenoTimer.cpo_CXXWARNFLAGS_ADD += -w
+ NativeAdrenoUserClient.cpo_CXXWARNFLAGS_ADD += -w
+ NativeAdrenoVm.cpo_CXXWARNFLAGS_ADD += -w
++G7Backlight.cpo_CXXWARNFLAGS_ADD += -w
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -42,3 +42,4 @@ iokit/Kernel/arm/g7adreno/NativeAdrenoSubmit.cpp                 optional iokitc
+ iokit/Kernel/arm/g7adreno/NativeAdrenoTimer.cpp                  optional iokitcpp
+ iokit/Kernel/arm/g7adreno/NativeAdrenoUserClient.cpp             optional iokitcpp
+ iokit/Kernel/arm/g7adreno/NativeAdrenoVm.cpp                     optional iokitcpp
++iokit/Kernel/arm/G7Backlight.cpp                                 optional iokitcpp
