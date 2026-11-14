@@ -1823,7 +1823,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,522 @@
+@@ -0,0 +1,568 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1882,6 +1882,20 @@
 +{
 +	return 0;
 +}
++int proc_selfpid(void);
++void proc_selfname(char *buf, int size);
++}
++
++/*
++ * GPU activity log (console lines "G7 GPU: ..."): who opens the accelerator, the plugin's other open types
++ * (its progress markers), the first failures per method, and running totals every 256 submits.
++ */
++static volatile uint32_t gStatOpens, gStatSubmits, gStatErrors, gStatCalls[20], gStatLogged;
++
++static void
++g7_stat_who(char *buf, int size)
++{
++	proc_selfname(buf, size);
 +}
 +
 +namespace {
@@ -2069,7 +2083,13 @@
 +	if (!gGpu || !gGpu->ready) {
 +		return kIOReturnNotReady;
 +	}
++	char who[24];
++	g7_stat_who(who, sizeof(who));
 +	if (type != kOpenType && type != 0) {
++		if (gStatLogged < 400) {
++			gStatLogged++;
++			IOLog("G7 GPU: %s[%d] open type %#x (plugin marker)\n", who, proc_selfpid(), (unsigned)type);
++		}
 +		return kIOReturnUnsupported;    /* the plugin's progress markers and anything else */
 +	}
 +	AGXDeviceUserClient *client = OSTypeAlloc(AGXDeviceUserClient);
@@ -2079,7 +2099,13 @@
 +			client->detach(this);
 +			client->release();
 +		}
++		IOLog("G7 GPU: %s[%d] open FAILED (no client slot)\n", who, proc_selfpid());
 +		return kIOReturnNoResources;
++	}
++	uint32_t opens = ++gStatOpens;
++	if (gStatLogged < 400) {
++		gStatLogged++;
++		IOLog("G7 GPU: %s[%d] opened the GPU (client %u)\n", who, proc_selfpid(), opens);
 +	}
 +	*handler = client;
 +	return kIOReturnSuccess;
@@ -2196,6 +2222,26 @@
 +		r = core_->dispatch(method, in, in_size, out, out_size, &gGpu->clock);
 +	}
 +	IOLockUnlock(gGpu->lock);
++	if (method < 20) {
++		gStatCalls[method]++;
++	}
++	if (r != kIOReturnSuccess) {
++		uint32_t e = ++gStatErrors;
++		if (e <= 40 && gStatLogged < 400) {
++			char who[24];
++			gStatLogged++;
++			g7_stat_who(who, sizeof(who));
++			IOLog("G7 GPU: %s method %u FAILED %#x (in %zu out %zu)\n", who, method, r, in_size, out_size);
++		}
++	}
++	if (method == NativeAdrenoMethodSubmit && r == kIOReturnSuccess) {
++		uint32_t s = ++gStatSubmits;
++		if (s == 1 || s == 16 || (s % 256) == 0) {
++			IOLog("G7 GPU: %u submits, %u opens, %u errors, allocs %u imports %u waits %u\n", s, gStatOpens,
++			    gStatErrors, gStatCalls[NativeAdrenoMethodBoAlloc], gStatCalls[NativeAdrenoMethodBoImport],
++			    gStatCalls[NativeAdrenoMethodWaitFence]);
++		}
++	}
 +	if (r == kIOReturnSuccess && out) {
 +		args->structureOutputSize = (uint32_t)out_size;
 +	}
