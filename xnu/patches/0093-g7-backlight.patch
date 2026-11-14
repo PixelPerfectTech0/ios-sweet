@@ -18,7 +18,7 @@
  }
 --- /dev/null
 +++ b/iokit/Kernel/arm/G7Backlight.cpp
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,322 @@
 +/*
 + * LG G7 backlight (g7bl=1, default): an AppleARMBacklight service, the class
 + * iOS CoreBrightness looks for, publishing IODisplayParameters.brightness
@@ -327,9 +327,15 @@
 +		return kIOReturnSuccess;              /* other keys (auto-brightness, commit, ...) accepted */
 +	}
 +	IOLockLock(bl_lock);
-+	bl_level = bl_from_ios(v);
-+	if (bl_power) {
-+		bl_apply(bl_level);
++	if (v == 0) {
++		/* iOS turns the display off with brightness 0 (factor 0): sinks fully off, not the 0.4 % floor.
++		 * bl_level keeps the last real level, so a wake from the framebuffer restores it. */
++		bl_apply(0);
++	} else {
++		bl_level = bl_from_ios(v);
++		if (bl_power) {
++			bl_apply(bl_level);
++		}
 +	}
 +	IOLockUnlock(bl_lock);
 +	publish(v > BL_IOS_MAX ? BL_IOS_MAX : v);
