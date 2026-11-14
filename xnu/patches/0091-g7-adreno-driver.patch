@@ -1823,7 +1823,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,586 @@
+@@ -0,0 +1,585 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1987,7 +1987,6 @@
 +	return 0;
 +}
 +
-+void
 +static char *gProgMsg;
 +static size_t gProgLen;
 +
