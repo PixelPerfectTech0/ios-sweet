@@ -1828,7 +1828,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,628 @@
+@@ -0,0 +1,620 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -2048,16 +2048,8 @@
 +		gPickNow[k] = rd(at);
 +		gPickSmr[k] = rd(0x800u + 4u * slots[k]);
 +	}
-+	/* Do S2CR writes reach the hardware? The slot's SMR is invalid, so a brief translate entry matches nothing. */
-+	if (found) {
-+		const uint32_t at = 0xc00u + 4u * slots[0], keep = rd(at);
-+		wr(at, 0x1u);
-+		__asm__ volatile("dsb sy" ::: "memory");
-+		gPickProbe = rd(at);
-+		wr(at, keep);
-+		__asm__ volatile("dsb sy" ::: "memory");
-+		IOLog("G7 GPU: stage8 S2CR write probe: wrote 0x1, read %#x\n", gPickProbe);
-+	}
++	/* No write probe here: this SMMU takes translate S2CR writes but ignores FAULT ones, so a probed
++	 * slot cannot be put back (diag7: wrote 0x1, restore to 0x200ff left 0x1, attach then saw it as taken). */
 +	for (unsigned b = 0; b < ncb && b < 32; b++) {
 +		if (!(banks_used & (1u << b))) {
 +			*bank = b;
