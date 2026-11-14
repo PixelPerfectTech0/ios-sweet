@@ -18,7 +18,7 @@
  }
 --- /dev/null
 +++ b/iokit/Kernel/arm/G7Backlight.cpp
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,333 @@
 +/*
 + * LG G7 backlight (g7bl=1, default): an AppleARMBacklight service, the class
 + * iOS CoreBrightness looks for, publishing IODisplayParameters.brightness
@@ -27,7 +27,7 @@
 + * G7's LCD; g7_backlight_power() turns them off while the display is off.
 + *
 + * PMIC writes are limited to the WLED sink brightness and sync registers
-+ * (0xd947, 0xd957/58, 0xd967/68, 0xd977/78), and only when the SPMI arbiter
++ * (0xd947, 0xd957/58, 0xd967/68, 0xd977/78, 0xd987/88), and only when the SPMI arbiter
 + * says the apps processor owns that peripheral. Register layout from the
 + * PMI8998 WLED4 description (sink base 0xd900, 12-bit brightness per string,
 + * sync toggle after an update).
@@ -52,7 +52,8 @@
 +#define BL_SINK      0xd9u
 +#define BL_SYNC      0x47u
 +#define BL_BRIGHT(n) (0x57u + 0x10u * (n))
-+#define BL_STRINGS   3u
++#define BL_STRINGS   4u          /* WLED4 has four sinks; all are driven so none stays at its boot level */
++#define BL_SINK_EN   0x46u       /* current sink enable, bits 7..4 = strings 1..4 (read only here) */
 +#define BL_MAX       4095u
 +#define BL_FLOOR     16u                  /* WLED4 works down to 0.4 % */
 +#define BL_IOS_MAX   65536u
@@ -173,7 +174,17 @@
 +			bl_level = cur;
 +		}
 +	}
-+	IOLog("G7 BACKLIGHT: WLED sink APID %u, boot level %u/%u\n", apid, bl_level, BL_MAX);
++	uint8_t en = 0;
++	(void)bl_read(BL_SINK_EN, &en);
++	uint32_t lv[BL_STRINGS] = {};
++	for (unsigned s = 0; s < BL_STRINGS; s++) {
++		uint8_t a = 0, b = 0;
++		if (!bl_read(BL_BRIGHT(s), &a) && !bl_read(BL_BRIGHT(s) + 1u, &b)) {
++			lv[s] = ((uint32_t)b << 8 | a) & BL_MAX;
++		}
++	}
++	IOLog("G7 BACKLIGHT: WLED sink APID %u, boot level %u/%u, sinks on %#x, strings %u/%u/%u/%u\n", apid,
++	    bl_level, BL_MAX, (unsigned)(en >> 4), lv[0], lv[1], lv[2], lv[3]);
 +	return true;
 +}
 +
