@@ -1823,7 +1823,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,568 @@
+@@ -0,0 +1,586 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1988,9 +1988,16 @@
 +}
 +
 +void
++static char *gProgMsg;
++static size_t gProgLen;
++
++void
 +progress(uint32_t step)
 +{
 +	IOLog("G7 GPU: stage8 GPU SMMU context step %u\n", step);
++	if (gProgMsg) {
++		snprintf(gProgMsg, gProgLen, "stage8: HUNG or still in: SMMU context step %u", step);
++	}
 +}
 +
 +/*
@@ -2275,6 +2282,9 @@
 +	if (gGpu) {
 +		G7_FAIL("stage8: already brought up");
 +	}
++	gProgMsg = msg;
++	gProgLen = n;
++	snprintf(msg, n, "stage8: HUNG or still in: SMMU map");
 +	vm_offset_t smmu = g7_gpu_smmu();
 +	if (!smmu) {
 +		G7_FAIL("stage8: GPU SMMU map failed");
@@ -2295,6 +2305,8 @@
 +		G7_FAIL("stage8: GPU SMMU context failed at step %u (%#x, program %u, route %u)", report.step, r,
 +		    report.program_status, report.route_status);
 +	}
++	gProgMsg = nullptr;
++	snprintf(msg, n, "stage8: HUNG or still in: context buffers");
 +	NativeAdrenoGpuContext *ctx = NativeAdrenoGpuContextObject();
 +	NativeAdrenoGpuBuffer buf[GpuBufferCount] = {};
 +	if (!ctx || NativeAdrenoGpuContextBuffers(buf)) {
@@ -2313,6 +2325,7 @@
 +	g->clock = {nullptr, now_us, idle};
 +	g->timeio = {nullptr, rd32};
 +
++	snprintf(msg, n, "stage8: HUNG or still in: SQE copy");
 +	/* SQE microcode into its buffer (index 0). */
 +	uint32_t words = 0;
 +	const uint32_t *fw = g7_gpu_sqe(&words);
@@ -2327,9 +2340,11 @@
 +	publish(nullptr, sq, words * 4u);
 +
 +	/* Registers, ring, SQE start, CP_ME_INIT. */
++	snprintf(msg, n, "stage8: HUNG or still in: GPU_SET hold / register setup");
 +	if (g7_gpu_prepare(kGmemBase)) {
 +		G7_FAIL("stage8: GMU did not hold the GPU on (GPU_SET)");
 +	}
++	snprintf(msg, n, "stage8: HUNG or still in: ring attach");
 +	const NativeAdrenoMemory &ringm = ctx->buffer(1), &memptrs = ctx->buffer(2);
 +	if ((r = g->ring.setGeneration(6)) ||
 +	    (r = g->ring.attach(&g->io, &g->cache, ringm.mapping(), ringm.bytes(), buf[1].iova,
@@ -2339,6 +2354,7 @@
 +	g7_gpu_wr(kCpSqeInstrBase, (uint32_t)buf[0].iova);
 +	g7_gpu_wr(kCpSqeInstrBase + 1, (uint32_t)(buf[0].iova >> 32));
 +	g7_gpu_wr(kCpSqeCntl, 1);
++	snprintf(msg, n, "stage8: HUNG or still in: CP_ME_INIT");
 +	NativeAdrenoCpInitConfig cfg{buf[0].iova, 0, 1, 6};
 +	uint32_t fence = 0, seen = 0;
 +	if ((r = g->cpinit.run(&g->io, &g->ring, &cfg, &fence))) {
@@ -2353,6 +2369,7 @@
 +	}
 +
 +	/* Zap shader, then leave secure mode. */
++	snprintf(msg, n, "stage8: HUNG or still in: zap shader");
 +	if (g7_gpu_zap()) {
 +		G7_FAIL("stage8: CP runs through the SMMU, but the zap shader was refused");
 +	}
@@ -2367,6 +2384,7 @@
 +	}
 +
 +	/* Submissions, timer, device facts, then publish. */
++	snprintf(msg, n, "stage8: HUNG or still in: submit attach");
 +	if ((r = g->submit.attach(g->vm, &g->ring))) {
 +		G7_FAIL("stage8: submit attach failed (%#x)", r);
 +	}
