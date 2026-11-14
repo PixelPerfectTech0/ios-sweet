@@ -1597,7 +1597,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/ArmSmmu4KStreams.c
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,166 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "ArmSmmu4KStreams.h"
 +#define FAULT (UINT32_C(2)<<16)
@@ -1610,6 +1610,7 @@
 +static uint32_t valid_s2cr(uint32_t id){return exids(id)?1u<<10:0;}
 +/* G7: CBNDX of a FAULT entry is ignored (MMU-500 here reads it back as 0xff). */
 +static int is_fault(uint32_t v,uint32_t valid_bit){return (v&~(valid_bit|255u))==FAULT;}
++static ArmSmmu4KStatus g7_mismatch(unsigned why,unsigned slot,uint32_t want,uint32_t got);
 +static int valid(uint32_t id,uint32_t smr,uint32_t s2cr)
 +{return exids(id)?!!(s2cr&(1u<<10)):!!(smr&(UINT32_C(1)<<31));}
 +static ArmSmmu4KStatus global(const ArmSmmu4KIo *io,ArmSmmu4KStreamResult *r)
