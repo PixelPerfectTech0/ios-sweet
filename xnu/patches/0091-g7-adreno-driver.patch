@@ -1823,7 +1823,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,599 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -2008,17 +2008,31 @@
 +pick_smmu(volatile uint8_t *s, unsigned slots[2], unsigned *bank)
 +{
 +	auto rd = [s](uint32_t off) { return *reinterpret_cast<volatile uint32_t *>(s + off); };
-+	const unsigned nsmr = rd(0x20) & 0xffu, ncb = rd(0x24) & 0xffu;
++	auto wr = [s](uint32_t off, uint32_t v) { *reinterpret_cast<volatile uint32_t *>(s + off) = v; };
++	const uint32_t id0 = rd(0x20);
++	const unsigned nsmr = id0 & 0xffu, ncb = rd(0x24) & 0xffu;
++	const bool exids = (id0 >> 8) & 1u;   /* extended stream ids: the valid bit is S2CR bit 10, not SMR bit 31 */
 +	uint32_t banks_used = 0;
 +	unsigned found = 0;
 +	for (unsigned i = 0; i < nsmr && i < 128; i++) {
 +		const uint32_t smr = rd(0x800u + 4u * i), s2cr = rd(0xc00u + 4u * i);
-+		if (smr & (1u << 31)) {
++		const bool live = exids ? (s2cr & (1u << 10)) != 0 : (smr & (1u << 31)) != 0;
++		if (live) {
 +			if (((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) < 32u) {
 +				banks_used |= 1u << (s2cr & 0xffu);
 +			}
 +		} else if (found < 2) {
 +			slots[found++] = i;
++		}
++	}
++	/* The core leases only slots parked as FAULT (S2CR type 2, no bank); firmware leaves unused
++	 * slots as bypass or translate-to-0. They match no stream, so parking them changes nothing. */
++	for (unsigned k = 0; k < found; k++) {
++		const uint32_t at = 0xc00u + 4u * slots[k], was = rd(at);
++		if ((was & ~(1u << 10)) != (2u << 16)) {
++			wr(at, 2u << 16);
++			__asm__ volatile("dsb sy" ::: "memory");
++			IOLog("G7 GPU: stage8 SMMU slot %u S2CR %#x -> FAULT (%#x)\n", slots[k], was, rd(at));
 +		}
 +	}
 +	for (unsigned b = 0; b < ncb && b < 32; b++) {
