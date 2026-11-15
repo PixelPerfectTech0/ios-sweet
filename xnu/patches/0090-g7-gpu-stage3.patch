@@ -787,7 +787,7 @@
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  extern kern_return_t thread_terminate(thread_t);
-@@ -57,9 +67,157 @@ void g7_gpu_init(void);
+@@ -57,9 +67,158 @@ void g7_gpu_init(void);
  #define G7G_GMU_AO_COUNTER_L        0x1f888u
  #define G7G_GMU_SPTPRAC_STATUS      0x1f8d0u
  
@@ -937,6 +937,7 @@
 +	char zap[160];
 +	volatile uint32_t smc_calls;   /* SMCs made so far, and the last x0 TrustZone returned */
 +	volatile uint64_t smc_last;
++	uint32_t zap_setup_len;        /* size passed to PAS mem setup */
 +	bool gx_ok, smmu_bypass, cp_ok;
 +	uint64_t zap_pa, zap_size;      /* from /chosen/memory-map G7Zap, read at init */
 +	uint32_t *ring;                 /* stage 6 ring (kernel view), its write index and scratch */
@@ -946,7 +947,7 @@
  	unsigned level;
  	char summary[160];
  } g7g;
-@@ -86,6 +244,42 @@ g7g_gmu_rd(uint32_t dword)
+@@ -86,6 +245,42 @@ g7g_gmu_rd(uint32_t dword)
  	return g7g_rd(g7g.gmu, dword * 4u - (G7G_GMU_PA - G7G_GPU_PA));
  }
  
@@ -989,7 +990,7 @@
  static void
  g7g_sleep(unsigned ms)
  {
-@@ -119,6 +313,854 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
+@@ -119,6 +314,862 @@ g7g_branch_on(vm_offset_t base, uint32_t off)
  	return false;
  }
  
@@ -1438,7 +1439,14 @@
 +	int64_t s_mem = -1, s_auth = -1;
 +	if (s_init == 0) {
 +		snprintf(g7g.zap, sizeof(g7g.zap), "zap: HUNG or still in: TrustZone call 3/4 (memory setup)");
-+		s_mem = g7g_scm(G7G_SCM_PAS_MEM_SETUP, 3, G7G_GPU_PAS_ID, G7G_ZAP_REGION_PA, load_mem, &res);
++		/* Linux qcom_mdt_load: size = ALIGN(p_paddr + p_memsz, 4K) - p_paddr, not the raw memsz
++		 * (diag14: the raw size got 0xffcfffba back). */
++		uint32_t setup_len = ((load_pa + load_mem + 0xfffu) & ~0xfffu) - load_pa;
++		if (setup_len > G7G_ZAP_REGION_SIZE) {
++			setup_len = G7G_ZAP_REGION_SIZE;
++		}
++		g7g.zap_setup_len = setup_len;
++		s_mem = g7g_scm(G7G_SCM_PAS_MEM_SETUP, 3, G7G_GPU_PAS_ID, G7G_ZAP_REGION_PA, setup_len, &res);
 +	}
 +	if (s_mem == 0) {
 +		snprintf(g7g.zap, sizeof(g7g.zap), "zap: HUNG or still in: copying the zap segment into its region");
@@ -1458,8 +1466,9 @@
 +	    "(result %#llx)\n", size, load_mem, load_pa, (long long)s_init, (long long)s_mem, (long long)s_auth,
 +	    (unsigned long long)res);
 +	if (s_auth != 0) {
-+		snprintf(g7g.zap, sizeof(g7g.zap), "stage7: TrustZone refused the zap (init %lld, mem %lld, auth %lld)",
-+		    (long long)s_init, (long long)s_mem, (long long)s_auth);
++		snprintf(g7g.zap, sizeof(g7g.zap), "stage7: TrustZone refused the zap (init %lld, mem %#llx, auth %lld) "
++		    "seg pa %#x mem %#x file %#x setup %#x", (long long)s_init, (unsigned long long)s_mem,
++		    (long long)s_auth, load_pa, load_mem, load_len, g7g.zap_setup_len);
 +		return -1;
 +	}
 +	snprintf(g7g.zap, sizeof(g7g.zap), "zap: TrustZone accepted it (init %lld mem %lld auth %lld)",
@@ -1844,7 +1853,7 @@
  /*
   * Stage 2: the GPU's bus clocks, the CX power domain and the GMU clocks
   * (GMU core clock from the 19.2 MHz crystal: slow but needs no PLL), then
-@@ -184,6 +1226,44 @@ g7g_stage2(void)
+@@ -184,6 +1235,44 @@ g7g_stage2(void)
  	snprintf(g7g.summary, sizeof(g7g.summary),
  	    "stage2: CX on, GMU clocks on, GMU %s (counter %#x -> %#x), CM3 reset %#x",
  	    ao1 != ao2 ? "ALIVE" : "not counting", ao1, ao2, rst);
@@ -1889,7 +1898,7 @@
  }
  
  static void
-@@ -229,6 +1309,14 @@ g7g_probe(void)
+@@ -229,6 +1318,14 @@ g7g_probe(void)
  	}
  }
  
@@ -1904,7 +1913,7 @@
  static void
  g7g_thread(void *arg __unused, wait_result_t wr __unused)
  {
-@@ -241,6 +1329,16 @@ g7g_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -241,6 +1338,16 @@ g7g_thread(void *arg __unused, wait_result_t wr __unused)
  	}
  	for (int i = 0; i < 60; i++) {
  		printf("G7 GPU: %s\n", g7g.summary[0] ? g7g.summary : "no result");
@@ -1921,7 +1930,7 @@
  		g7g_sleep(10000);
  	}
  	(void)thread_terminate(current_thread());
-@@ -254,6 +1352,15 @@ g7_gpu_init(void)
+@@ -254,6 +1361,15 @@ g7_gpu_init(void)
  	if (g7g.level == 0) {
  		return;
  	}
