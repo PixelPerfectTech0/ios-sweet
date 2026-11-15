@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,621 @@
+@@ -0,0 +1,716 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1863,6 +1863,7 @@
 +#include <IOKit/IOMemoryDescriptor.h>
 +#include <IOKit/IOBufferMemoryDescriptor.h>
 +#include <kern/clock.h>
++#include <kern/thread.h>
 +#include <pexpert/pexpert.h>
 +#include "NativeAdrenoGpuContext.h"
 +#include "NativeAdrenoCpInit.h"
@@ -1900,6 +1901,9 @@
 + * (its progress markers), the first failures per method, and running totals every 256 submits.
 + */
 +static volatile uint32_t gStatOpens, gStatSubmits, gStatErrors, gStatCalls[20], gStatLogged;
++/* Set by the hang watchdog when the CP stopped making progress on a submission: every wait then fails (Turnip reports the device
++ * lost) instead of waiting forever, which held the render server, and with it the lock screen, at boot (diag15, g7gpu=8). */
++static volatile bool gHung;
 +
 +static void
 +g7_stat_who(char *buf, int size)
@@ -2255,6 +2259,36 @@
 +	void *out = args->structureOutput;
 +	size_t out_size = args->structureOutputSize;
 +	IOReturn r;
++	if (method == NativeAdrenoMethodWaitFence && in_size == sizeof(NativeAdrenoAbiWaitFence)) {
++		/* Poll the fence once per millisecond with the lock dropped in between. The core's wait spins on the CPU with the
++		 * one GPU lock held for the whole timeout (100 ms a call from Turnip), which stalled every other GPU call of every
++		 * process behind a frame that had not finished. */
++		NativeAdrenoAbiWaitFence req = *reinterpret_cast<const NativeAdrenoAbiWaitFence *>(in);
++		const uint64_t deadline = now_us(nullptr) + req.timeout_ns / 1000u;
++		req.timeout_ns = 0;
++		for (;;) {
++			if (gHung) {
++				r = kIOReturnIOError;
++				break;
++			}
++			IOLockLock(gGpu->lock);
++			r = core_->dispatch(method, &req, sizeof(req), out, out_size, &gGpu->clock);
++			IOLockUnlock(gGpu->lock);
++			if (r != kIOReturnTimeout || now_us(nullptr) >= deadline) {
++				break;
++			}
++			IOSleep(1);
++		}
++		gStatCalls[method]++;
++		if (r != kIOReturnSuccess && r != kIOReturnTimeout && gStatLogged < 400) {
++			char who[24];
++			gStatLogged++;
++			g7_stat_who(who, sizeof(who));
++			IOLog("G7 GPU: %s wait for fence %llu FAILED %#x%s\n", who, (unsigned long long)req.fence, r,
++			    gHung ? " (GPU hung)" : "");
++		}
++		return r;
++	}
 +	IOLockLock(gGpu->lock);
 +	if (method == NativeAdrenoMethodBoImport) {
 +		if (in_size != sizeof(NativeAdrenoAbiBoImport) || out_size != sizeof(NativeAdrenoAbiBoAllocReply)) {
@@ -2311,6 +2345,61 @@
 +	}
 +	IOLockUnlock(gGpu->lock);
 +	return d ? kIOReturnSuccess : kIOReturnBadArgument;
++}
++
++/*
++ * msm's hangcheck (DRM_MSM_HANGCHECK_DEFAULT_PERIOD, 500 ms): a submission whose fence has not moved and whose CP shows no progress
++ * twice in a row is a hang. There is no GPU restart on this board yet, so a hang is final: the status reports a fault (Turnip's
++ * check_status loses the device) and every wait fails from then on, so no process waits forever. Each new state is logged once
++ * (fence done/last, CP progress words, SMMU fault), and while clients are open a summary every 5 s, so one text boot shows where
++ * the GPU stops.
++ */
++static void
++g7_gpu_watchdog(void *, wait_result_t)
++{
++	uint32_t ticks = 0, last_done = ~0u, last_sub = ~0u, last_calls = ~0u;
++	for (;;) {
++		IOSleep(500);
++		G7Gpu *g = gGpu;
++		if (!g) {
++			continue;
++		}
++		bool hung = false;
++		uint32_t done = 0, sub, cp[6] = {}, flt[4] = {};
++		IOLockLock(g->lock);
++		if (!gHung) {
++			(void)g->submit.hangCheck(&hung);
++		}
++		(void)g->ring.fenceValue(&done);
++		sub = g->ring.lastSubmitted();
++		(void)g->ring.progressState(cp);
++		if (g->vm) {
++			(void)g->vm->faultState(flt);
++		}
++		if (hung) {
++			gHung = true;
++			g->status.noteFault();
++		}
++		IOLockUnlock(g->lock);
++		if (hung) {
++			IOLog("G7 GPU: HANG: fence %u of %u, cp %#x %#x %#x %#x %#x %#x, smmu fault %#x far %#x%08x syn %#x; "
++			    "GPU work now fails instead of waiting\n", done, sub, cp[0], cp[1], cp[2], cp[3], cp[4], cp[5],
++			    flt[0], flt[2], flt[1], flt[3]);
++		}
++		const uint32_t calls = gStatCalls[NativeAdrenoMethodSubmit] + gStatCalls[NativeAdrenoMethodBoAlloc] +
++		    gStatCalls[NativeAdrenoMethodWaitFence] + gStatOpens;
++		if (++ticks % 10 == 0 && (done != last_done || sub != last_sub || calls != last_calls) && gStatLogged < 400) {
++			gStatLogged++;
++			IOLog("G7 GPU: live: opens %u, fence %u of %u, submits %u allocs %u maps %u cpumaps %u waits %u errors %u%s, "
++			    "smmu fault %#x far %#x%08x\n", gStatOpens, done, sub, gStatCalls[NativeAdrenoMethodSubmit],
++			    gStatCalls[NativeAdrenoMethodBoAlloc], gStatCalls[NativeAdrenoMethodBoMap],
++			    gStatCalls[NativeAdrenoMethodBoCpuMap], gStatCalls[NativeAdrenoMethodWaitFence], gStatErrors,
++			    gHung ? ", HUNG" : "", flt[0], flt[2], flt[1]);
++			last_done = done;
++			last_sub = sub;
++			last_calls = calls;
++		}
++	}
 +}
 +
 +/* ---- bring-up, called by bsd/dev/g7_gpu.c with g7gpu=8 ---- */
@@ -2446,6 +2535,12 @@
 +	g->info.flags = NativeAdrenoDeviceClientIova;
 +	g->ready = true;
 +	gGpu = g;
++	{
++		thread_t t = nullptr;
++		if (kernel_thread_start(g7_gpu_watchdog, nullptr, &t) == KERN_SUCCESS) {
++			thread_deallocate(t);
++		}
++	}
 +	if (gAccelerator) {
 +		gAccelerator->registerService();
 +	}
