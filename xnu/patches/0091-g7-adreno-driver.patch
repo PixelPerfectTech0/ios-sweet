@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,780 @@
+@@ -0,0 +1,802 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1967,17 +1967,27 @@
 +};
 +G7Gpu *gGpu;
 +
++/* Breadcrumb of the last GPU register access: bit 31 a write, bit 30 still in progress. A CPU frozen on a register
++ * that does not answer leaves bit 30 set, and the watchdog names the register. */
++volatile uint32_t gRegLast, gRegCount;
++
 +int
 +rd32(void *, uint32_t reg, uint32_t *v)
 +{
++	gRegLast = reg | (1u << 30);
 +	*v = g7_gpu_rd(reg);
++	gRegLast = reg;
++	gRegCount++;
 +	return 0;
 +}
 +
 +int
 +wr32(void *, uint32_t reg, uint32_t v)
 +{
++	gRegLast = reg | (1u << 31) | (1u << 30);
 +	g7_gpu_wr(reg, v);
++	gRegLast = reg | (1u << 31);
++	gRegCount++;
 +	return 0;
 +}
 +
@@ -2235,8 +2245,9 @@
 +AGXDeviceUserClient::clientClose()
 +{
 +	if (open_) {
++		G7CallTrace trace(100, 0, 0);   /* m100: a client closing (waits up to 2 s for its jobs with the lock held) */
 +		IOLockLock(gGpu->lock);
-+		(void)core_->releaseAll(&gGpu->clock, kWaitUs);
++		trace.r = core_->releaseAll(&gGpu->clock, kWaitUs);
 +		(void)core_->close();
 +		gGpu->slots_used &= ~(1u << slot_);
 +		open_ = false;
@@ -2420,8 +2431,19 @@
 +		if (!IOLockTryLock(g->lock)) {
 +			++busy_ticks;
 +			if (busy_ticks % 6 == 4 || (running_ms >= 3000 && ticks % 10 == 0)) {
-+				IOLog("G7 GPU: STUCK? GPU lock busy %u s; newest call m%u by %s running %llu ms (calls %u)\n",
-+				    busy_ticks / 2, gCurMethod, gCurWho, (unsigned long long)running_ms, gCurSeq);
++				/* Who holds it: the register breadcrumb tells a CPU frozen on one access (count still, "busy") from
++				 * a loop (count moving). The fence words live in memory, so they are safe to read without the lock. */
++				static uint32_t last_count;
++				const uint32_t reg = gRegLast, count = gRegCount;
++				uint32_t fdone = 0;
++				(void)g->ring.fenceValue(&fdone);
++				if (busy_ticks <= 64 || busy_ticks % 120 == 4) {
++					IOLog("G7 GPU: STUCK? lock busy %u s; newest m%u by %s %llu ms (calls %u); last reg %s %#x%s, "
++					    "reg accesses +%u; fence %u of %u\n", busy_ticks / 2, gCurMethod, gCurWho,
++					    (unsigned long long)running_ms, gCurSeq, (reg >> 31) ? "write" : "read", reg & 0xffffu,
++					    ((reg >> 30) & 1) ? " NOT ANSWERED" : "", count - last_count, fdone, g->ring.lastSubmitted());
++				}
++				last_count = count;
 +			}
 +			++ticks;
 +			continue;
@@ -4753,7 +4775,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/NativeAdrenoRing.cpp
-@@ -0,0 +1,531 @@
+@@ -0,0 +1,530 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "NativeAdrenoRing.h"
 +#include "AdrenoPM4.h"
@@ -4913,14 +4935,13 @@
 +}
 +IOReturn NativeAdrenoRing::drainBus(uint32_t *ack)
 +{
-+    enum : uint32_t {GbifHalt = 0x3c45, GbifHaltAck = 0x3c46, ClientHalt = 1u, ArbHalt = 2u};
++    enum : uint32_t {VbifXinHaltCtrl0 = 0x3080, VbifXinHaltCtrl1 = 0x3081, XinMask = 0xfu};   /* G7: A630 VBIF */
 +    if(!attached_ || poisoned_ || !ack)return kIOReturnNotReady;
 +    ack[0]=ack[1]=0;
-+    if(io_.write32(io_.cookie,GbifHalt,ClientHalt))return poison();
-+    for(unsigned i=0;i<20000 && !(ack[0]&ClientHalt);++i)if(io_.read32(io_.cookie,GbifHaltAck,&ack[0]))return poison();
-+    if(io_.write32(io_.cookie,GbifHalt,ClientHalt|ArbHalt))return poison();
-+    for(unsigned i=0;i<20000 && !(ack[1]&ArbHalt);++i)if(io_.read32(io_.cookie,GbifHaltAck,&ack[1]))return poison();
-+    if(io_.write32(io_.cookie,GbifHalt,0))return poison();
++    if(io_.write32(io_.cookie,VbifXinHaltCtrl0,XinMask))return poison();
++    for(unsigned i=0;i<20000 && (ack[0]&XinMask)!=XinMask;++i)if(io_.read32(io_.cookie,VbifXinHaltCtrl1,&ack[0]))return poison();
++    if(io_.write32(io_.cookie,VbifXinHaltCtrl0,0))return poison();
++    ack[1]=ack[0];
 +    return kIOReturnSuccess;
 +}
 +/* Packs one TYPE7 packet into words; returns the next free index or 0 when the header cannot be built. */
