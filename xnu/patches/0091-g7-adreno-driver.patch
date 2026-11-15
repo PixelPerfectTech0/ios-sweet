@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,716 @@
+@@ -0,0 +1,780 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1904,6 +1904,24 @@
 +/* Set by the hang watchdog when the CP stopped making progress on a submission: every wait then fails (Turnip reports the device
 + * lost) instead of waiting forever, which held the render server, and with it the lock screen, at boot (diag15, g7gpu=8). */
 +static volatile bool gHung;
++
++/*
++ * Call trace (diag17: backboardd's main thread sat in one IOConnectCallStructMethod of Turnip's device creation for minutes and the
++ * watchdog printed nothing): the newest call in progress (method, process, start), the first calls one line each, then only slow or
++ * failed ones. The watchdog reports a call that has not returned, and a GPU lock it cannot take, without waiting for that lock.
++ */
++static volatile uint32_t gCurMethod, gCurSeq, gTraceLines;
++static volatile uint64_t gCurStart;
++static char gCurWho[24];
++
++struct G7CallTrace {
++	uint32_t method, seq;
++	uint64_t start;
++	size_t in, out;
++	IOReturn r = kIOReturnSuccess;
++	G7CallTrace(uint32_t m, size_t i, size_t o);
++	~G7CallTrace();
++};
 +
 +static void
 +g7_stat_who(char *buf, int size)
@@ -2137,9 +2155,11 @@
 +	char who[24];
 +	g7_stat_who(who, sizeof(who));
 +	if (type != kOpenType && type != 0) {
-+		if (gStatLogged < 400) {
-+			gStatLogged++;
-+			IOLog("G7 GPU: %s[%d] open type %#x (plugin marker)\n", who, proc_selfpid(), (unsigned)type);
++		/* The plugin streams text one marker per character (hundreds a process): only the first few are shown, so they do
++		 * not use up the activity log (diag17: no line after them). */
++		static volatile uint32_t markers;
++		if (++markers <= 4) {
++			IOLog("G7 GPU: %s[%d] open type %#x (plugin marker, more not shown)\n", who, proc_selfpid(), (unsigned)type);
 +		}
 +		return kIOReturnUnsupported;    /* the plugin's progress markers and anything else */
 +	}
@@ -2238,6 +2258,32 @@
 +	IOUserClient::free();
 +}
 +
++G7CallTrace::G7CallTrace(uint32_t m, size_t i, size_t o) : method(m), in(i), out(o)
++{
++	start = now_us(nullptr);
++	seq = ++gCurSeq;
++	gCurMethod = m;
++	gCurStart = start;
++	g7_stat_who(gCurWho, sizeof(gCurWho));
++}
++
++G7CallTrace::~G7CallTrace()
++{
++	const uint64_t ms = (now_us(nullptr) - start) / 1000u;
++	if (gCurSeq == seq) {
++		gCurStart = 0;
++	}
++	/* Fence waits that time out are Turnip's normal 100 ms slices: not shown unless they fail. */
++	const bool routine_wait = method == NativeAdrenoMethodWaitFence && (r == kIOReturnTimeout || r == kIOReturnSuccess);
++	const bool show = (seq <= 80 && !routine_wait) || ((ms >= 200 && !routine_wait) || (r != kIOReturnSuccess && !routine_wait));
++	if (show && gTraceLines < 160) {
++		char who[24];
++		gTraceLines++;
++		g7_stat_who(who, sizeof(who));
++		IOLog("G7 GPU: #%u %s m%u in %zu out %zu -> %#x, %llu ms\n", seq, who, method, in, out, r, (unsigned long long)ms);
++	}
++}
++
 +IOReturn
 +AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
 +    IOExternalMethodDispatch *, OSObject *, void *)
@@ -2258,7 +2304,8 @@
 +	}
 +	void *out = args->structureOutput;
 +	size_t out_size = args->structureOutputSize;
-+	IOReturn r;
++	G7CallTrace trace(method, in_size, out_size);
++	IOReturn &r = trace.r;
 +	if (method == NativeAdrenoMethodWaitFence && in_size == sizeof(NativeAdrenoAbiWaitFence)) {
 +		/* Poll the fence once per millisecond with the lock dropped in between. The core's wait spins on the CPU with the
 +		 * one GPU lock held for the whole timeout (100 ms a call from Turnip), which stalled every other GPU call of every
@@ -2366,7 +2413,24 @@
 +		}
 +		bool hung = false;
 +		uint32_t done = 0, sub, cp[6] = {}, flt[4] = {};
-+		IOLockLock(g->lock);
++		/* Never wait for the lock here: a call stuck while holding it would silence the watchdog too. */
++		static uint32_t busy_ticks;
++		const uint64_t cur = gCurStart;
++		const uint64_t running_ms = cur ? (now_us(nullptr) - cur) / 1000u : 0;
++		if (!IOLockTryLock(g->lock)) {
++			++busy_ticks;
++			if (busy_ticks % 6 == 4 || (running_ms >= 3000 && ticks % 10 == 0)) {
++				IOLog("G7 GPU: STUCK? GPU lock busy %u s; newest call m%u by %s running %llu ms (calls %u)\n",
++				    busy_ticks / 2, gCurMethod, gCurWho, (unsigned long long)running_ms, gCurSeq);
++			}
++			++ticks;
++			continue;
++		}
++		busy_ticks = 0;
++		if (running_ms >= 3000 && ticks % 10 == 0) {
++			IOLog("G7 GPU: STUCK? call m%u by %s running %llu ms with the GPU lock free (calls %u)\n",
++			    gCurMethod, gCurWho, (unsigned long long)running_ms, gCurSeq);
++		}
 +		if (!gHung) {
 +			(void)g->submit.hangCheck(&hung);
 +		}
