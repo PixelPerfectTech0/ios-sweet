@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,621 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -2416,6 +2416,7 @@
 +	if (g7_gpu_zap()) {
 +		G7_FAIL("stage8: CP runs through the SMMU, but the zap shader was refused");
 +	}
++	snprintf(msg, n, "stage8: HUNG or still in: CP_SET_SECURE_MODE after zap");
 +	uint32_t secure[2];
 +	if (AdrenoPM4Type7(kSetSecureMode, 1, &secure[0]) != AdrenoPM4Success) {
 +		G7_FAIL("stage8: packet encoding failed");
