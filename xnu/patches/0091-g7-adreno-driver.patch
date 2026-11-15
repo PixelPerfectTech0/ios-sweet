@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,802 @@
+@@ -0,0 +1,816 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1970,6 +1970,7 @@
 +/* Breadcrumb of the last GPU register access: bit 31 a write, bit 30 still in progress. A CPU frozen on a register
 + * that does not answer leaves bit 30 set, and the watchdog names the register. */
 +volatile uint32_t gRegLast, gRegCount;
++extern "C" volatile uint32_t native_adreno_stall[2 + NativeAdrenoRingStallWords], native_adreno_stall_mem[4 + 3 * 17 + 4];
 +
 +int
 +rd32(void *, uint32_t reg, uint32_t *v)
@@ -2471,6 +2472,19 @@
 +			IOLog("G7 GPU: HANG: fence %u of %u, cp %#x %#x %#x %#x %#x %#x, smmu fault %#x far %#x%08x syn %#x; "
 +			    "GPU work now fails instead of waiting\n", done, sub, cp[0], cp[1], cp[2], cp[3], cp[4], cp[5],
 +			    flt[0], flt[2], flt[1], flt[3]);
++			/* The core's stall snapshot (NativeAdrenoSubmit::noteStall, taken at 50 ms and 1 s of a stall): the CP registers,
++			 * then 16 words of the IB the CP stopped in, from 12 before the dword it reached, so the packet it waits on is shown. */
++			const volatile uint32_t *s = native_adreno_stall, *m = native_adreno_stall_mem;
++			IOLog("G7 GPU: STALL fence %u waits %u rbbm %#x %#x %#x %#x int %#x cp %#x %#x %#x rptr %#x wptr %#x\n",
++			    s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11]);
++			IOLog("G7 GPU: STALL ib1 %#x%08x rem %#x ib2 %#x%08x rem %#x; %#x %#x %#x %#x %#x %#x\n",
++			    s[13], s[12], s[14], s[16], s[15], s[17], s[18], s[19], s[20], s[21], s[22], s[23]);
++			for (unsigned part = 0; part < 2; part++) {
++				const volatile uint32_t *w = &m[4 + 1 + part * 8];
++				IOLog("G7 GPU: IB @%u+%u: %08x %08x %08x %08x %08x %08x %08x %08x\n", m[4], part * 8,
++				    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++			}
++			IOLog("G7 GPU: IB handles next %u br %u bv %u bv2 %u\n", m[55], m[56], m[57], m[58]);
 +		}
 +		const uint32_t calls = gStatCalls[NativeAdrenoMethodSubmit] + gStatCalls[NativeAdrenoMethodBoAlloc] +
 +		    gStatCalls[NativeAdrenoMethodWaitFence] + gStatOpens;
