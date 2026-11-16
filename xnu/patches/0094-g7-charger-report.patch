@@ -1,0 +1,65 @@
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -91,7 +91,8 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	bool pm6150 = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 ||
+ 	    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
+ 	/* LG G7: PMI8998 charger, USB input and fuel gauge (read only). */
+-	bool pmi8998 = sid == 2 && (peripheral == 0x10 || peripheral == 0x13 || peripheral == 0x40);
++	bool pmi8998 = sid == 2 && (peripheral == 0x10 || peripheral == 0x12 || peripheral == 0x13 ||
++	    peripheral == 0x16 || peripheral == 0x40);   /* CHGR, BATIF, USBIN, MISC, FG SOC */
+ 	if (!sp_ready || !out || addr > 0xffffu || !(pm6150 || pmi8998)) {
+ 		return -1;
+ 	}
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -210,6 +210,42 @@ SweetBattery::estimatePercent(unsigned mv)
+ 	return 100;
+ }
+ 
++/*
++ * G7 charger report (read only): the PMI8998 SMB2 registers that decide whether and how fast it charges, as raw bytes, at the first
++ * poll, whenever the charger state or USB presence changes, and every 2 minutes. CHGR 0x10: status 1/2/3/7/8, INT_RT, enable cmd,
++ * CFG2, fast-charge current, float voltage. BATIF 0x12: INT_RT. USBIN 0x13: APSD status/result, INT_RT, CMD_IL, ICL options,
++ * ICL setting. MISC 0x16: ICL now, AICL status, power path, INT_RT, watchdog config, bark/bite config.
++ */
++static void
++g7ChargerReport(uint8_t charger, uint8_t usb)
++{
++	static unsigned polls;
++	static int last = -1;
++	const int now = (int)((charger & 7u) | ((usb & 0x10u) << 4));
++	if (polls++ % 4 != 0 && now == last) {
++		return;
++	}
++	last = now;
++	static const uint16_t regs[] = {
++		0x1006, 0x1007, 0x1008, 0x100d, 0x100e, 0x1010, 0x1042, 0x1051, 0x1061, 0x1070,
++		0x1210,
++		0x1307, 0x1308, 0x1310, 0x1340, 0x1366, 0x1370,
++		0x1607, 0x160a, 0x160b, 0x1610, 0x1651, 0x1653,
++	};
++	uint8_t v[sizeof(regs) / sizeof(regs[0])];
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		if (sweet_spmi_read(2, regs[i], &v[i])) {
++			v[i] = 0xee;
++		}
++	}
++	IOLog("SWEET CHG: chgr st %02x %02x %02x %02x %02x rt %02x en %02x cfg2 %02x fcc %02x fv %02x | bat rt %02x
++",
++	    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10]);
++	IOLog("SWEET CHG: usb apsd %02x %02x rt %02x il %02x iclopt %02x icl %02x | misc icl %02x aicl %02x path %02x rt %02x wd %02x %02x
++",
++	    v[11], v[12], v[13], v[14], v[15], v[16], v[17], v[18], v[19], v[20], v[21], v[22]);
++}
++
+ /* G7 (sweetbattery=2): PMI8998 on SPMI SID 2. Returns false if unreadable. */
+ bool
+ SweetBattery::pollG7(void)
+@@ -224,6 +260,7 @@ SweetBattery::pollG7(void)
+ 		}
+ 		return false;   /* unreadable, torn or not yet valid: keep the last value */
+ 	}
++	g7ChargerReport(charger, usb);
+ 	unsigned percent = ((unsigned)soc * 100u + 127u) / 255u;
+ 	if (percent < 1) {
+ 		percent = 1;
