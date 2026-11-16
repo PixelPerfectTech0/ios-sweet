@@ -12,7 +12,25 @@
  	}
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
-@@ -210,6 +210,40 @@ SweetBattery::estimatePercent(unsigned mv)
+@@ -30,7 +30,9 @@ private:
+ 	bool fG7, fG7Published;                 /* sweetbattery=2: LG G7 PMI8998 */
+ 	int fLastG7Percent, fLastG7State, fLastG7Usb;
+ 	unsigned fG7Failures;
++	int fLastG7Adapter;
+ 	bool pollG7(void);
++	void publishG7Adapter(bool external);
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+@@ -59,6 +61,7 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	fG7 = fG7Published = false;
+ 	fLastG7Percent = fLastG7State = fLastG7Usb = -1;
+ 	fG7Failures = 0;
++	fLastG7Adapter = -1;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -210,6 +213,128 @@ SweetBattery::estimatePercent(unsigned mv)
  	return 100;
  }
  
@@ -50,10 +68,98 @@
 +	    v[11], v[12], v[13], v[14], v[15], v[16], v[17], v[18], v[19], v[20], v[21], v[22]);
 +}
 +
++/*
++ * G7: what the USB port is plugged into. The PMI8998 detects it in hardware (APSD, USBIN 0x1308: bit 0 SDP = a computer's
++ * USB port, 1 OCP = proprietary charger, 2 CDP = a computer's charging port, 3 DCP = wall charger, 4 float = unknown,
++ * 5/6 Quick Charge 2/3) and MISC 0x1607 holds the input current it allows now, in 25 mA steps (diag24 on the PC: SDP,
++ * 0x14 = 500 mA). Published the way iOS reads a power adapter: AdapterDetails with an IOPSKeys.h FamilyCode.
++ */
++void
++SweetBattery::publishG7Adapter(bool external)
++{
++	uint8_t apsd = 0, icl = 0;
++	const bool ok = external && !sweet_spmi_read(2, 0x1308, &apsd) && !sweet_spmi_read(2, 0x1607, &icl);
++	UInt32 family = 0xe0024000u;            /* kIOPSFamilyCodeDisconnected */
++	const char *what = "nothing";
++	if (ok) {
++		if (apsd & 0x60u) {
++			family = 0xe0004004u;           /* kIOPSFamilyCodeUSBChargingPortDedicated */
++			what = "wall charger (Quick Charge)";
++		} else if (apsd & 0x08u) {
++			family = 0xe0004004u;
++			what = "wall charger";
++		} else if (apsd & 0x04u) {
++			family = 0xe0004005u;           /* kIOPSFamilyCodeUSBChargingPortDownstream */
++			what = "computer (charging USB port)";
++		} else if (apsd & 0x01u) {
++			family = 0xe0004000u;           /* kIOPSFamilyCodeUSBHost */
++			what = "computer (USB port)";
++		} else if (apsd & 0x02u) {
++			family = 0xe0004006u;           /* kIOPSFamilyCodeUSBChargingPort */
++			what = "charger (proprietary)";
++		} else {
++			family = 0xe0004007u;           /* kIOPSFamilyCodeUSBUnknown: floating data lines or not detected yet */
++			what = "charger (unknown type)";
++		}
++	} else if (external) {
++		family = 0xe0004007u;
++		what = "charger (unreadable)";
++	}
++	const unsigned ma = ok ? (unsigned)icl * 25u : 0u;
++	unsigned watts = (ma * 5u + 500u) / 1000u;
++	if (external && watts == 0) {
++		watts = 1;
++	}
++	OSDictionary *details = OSDictionary::withCapacity(8);
++	OSArray *raw = OSArray::withCapacity(1);
++	if (details) {
++		const struct {
++			const char *key;
++			UInt32 value;
++		} numbers[] = {
++			{"FamilyCode", family}, {"Watts", watts}, {"Current", ma}, {"Voltage", external ? 5000u : 0u},
++			{"AdapterID", 0}, {"Source", 0}, {"SweetAPSD", apsd},
++		};
++		for (unsigned i = 0; i < sizeof(numbers) / sizeof(numbers[0]); i++) {
++			OSNumber *number = OSNumber::withNumber(numbers[i].value, 32);
++			if (number) {
++				details->setObject(numbers[i].key, number);
++				number->release();
++			}
++		}
++		OSString *name = OSString::withCString(what);
++		if (name) {
++			details->setObject("Description", name);
++			details->setObject("Name", name);
++			name->release();
++		}
++		const OSSymbol *key = OSSymbol::withCString("AdapterDetails");
++		if (key) {
++			setPSProperty(key, details);
++			key->release();
++		}
++		if (raw) {
++			raw->setObject(details);
++			key = OSSymbol::withCString("AppleRawAdapterDetails");
++			if (key) {
++				setPSProperty(key, raw);
++				key->release();
++			}
++		}
++		details->release();
++	}
++	OSSafeReleaseNULL(raw);
++	const int now = external ? (int)((unsigned)apsd | (unsigned)icl << 8 | 1u << 16) : 0;
++	if (now != fLastG7Adapter) {
++		IOLog("SWEET CHG: connected to %s, input limit %u mA (%u W), apsd %02x\n", what, ma, watts, apsd);
++		fLastG7Adapter = now;
++	}
++}
++
  /* G7 (sweetbattery=2): PMI8998 on SPMI SID 2. Returns false if unreadable. */
  bool
  SweetBattery::pollG7(void)
-@@ -224,6 +258,7 @@ SweetBattery::pollG7(void)
+@@ -224,6 +349,7 @@ SweetBattery::pollG7(void)
  		}
  		return false;   /* unreadable, torn or not yet valid: keep the last value */
  	}
@@ -61,3 +167,11 @@
  	unsigned percent = ((unsigned)soc * 100u + 127u) / 255u;
  	if (percent < 1) {
  		percent = 1;
+@@ -234,6 +360,7 @@ SweetBattery::pollG7(void)
+ 	bool charging = external && state <= 4 && !full;
+ 	/* Rough voltage from the charge level, only for the battery details page. */
+ 	unsigned mv = 3400 + percent * 8;
++	publishG7Adapter(external);
+ 	publish(full ? 100 : percent, mv, 0, external, external, charging, full, true, false);
+ 	if (fLastG7Percent != (int)percent || fLastG7State != (int)state || fLastG7Usb != (int)external) {
+ 		IOLog("SWEET BATTERY: G7 PMI8998 soc %u/255 = %u%%, usb %d, charger state %u\n",

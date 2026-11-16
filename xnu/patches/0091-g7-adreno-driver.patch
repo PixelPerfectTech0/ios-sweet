@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,818 @@
+@@ -0,0 +1,866 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1970,6 +1970,10 @@
 +/* Breadcrumb of the last GPU register access: bit 31 a write, bit 30 still in progress. A CPU frozen on a register
 + * that does not answer leaves bit 30 set, and the watchdog names the register. */
 +volatile uint32_t gRegLast, gRegCount;
++/* The first submission's command buffers (diag25): where the CP stops inside them. */
++enum : unsigned { kIbKeep = 2, kIbWords = 64 };
++volatile uint32_t gIbSaved, gIbBuffers, gIbDwords[kIbKeep], gIbRead[kIbKeep], gIbWord[kIbKeep][kIbWords];
++volatile uint64_t gIbIova[kIbKeep];
 +extern "C" volatile uint32_t native_adreno_stall[2 + NativeAdrenoRingStallWords], native_adreno_stall_mem[4 + 3 * 17 + 4];
 +extern "C" volatile uint32_t native_adreno_wc_enabled, native_adreno_io_coherent, native_adreno_wc_audit[6],
 +    native_adreno_wc_distrusted;
@@ -2351,6 +2355,39 @@
 +		return r;
 +	}
 +	IOLockLock(gGpu->lock);
++	if (method == NativeAdrenoMethodSubmit && in_size >= 32 && !gIbSaved) {
++		/* diag24: the CP takes the whole first IB (rem 0) but stops about 17 dwords in with only CP_BUSY set. Keep its first
++		 * words (read through the descriptor only: an uncached kernel map turned the user pages into device memory, diag23
++		 * SIGBUS) to print beside the HANG line. */
++		const NativeAdrenoAbiSubmit *sub = reinterpret_cast<const NativeAdrenoAbiSubmit *>(in);
++		const uint32_t nbuf = sub->buffer_count;
++		if (nbuf && 32u + (size_t)nbuf * sizeof(NativeAdrenoAbiSubmitBuffer) <= in_size) {
++			gIbSaved = 1;
++			gIbBuffers = nbuf;
++			for (uint32_t b = 0; b < nbuf && b < kIbKeep; b++) {
++				const NativeAdrenoAbiSubmitBuffer &buf = sub->buffers[b];
++				gIbIova[b] = buf.iova;
++				gIbDwords[b] = (uint32_t)(buf.bytes / 4);
++				uint64_t base = 0;
++				size_t bytes = 0;
++				unsigned perm = 0;
++				NativeAdrenoMemory *mem = core_->memoryOf(buf.handle);
++				const uint64_t vmh = gGpu->vm ? gGpu->vm->handleAt(buf.iova) : 0;
++				IOBufferMemoryDescriptor *desc = mem ? mem->descriptor() : nullptr;
++				if (desc && vmh && !gGpu->vm->describe(vmh, &base, &bytes, &perm) && buf.iova >= base) {
++					const IOByteCount off = (IOByteCount)(buf.iova - base);
++					const uint32_t want = gIbDwords[b] < kIbWords ? gIbDwords[b] : kIbWords;
++					uint32_t tmp[kIbWords] = {};
++					if (off + 4u * want <= desc->getLength()) {
++						gIbRead[b] = (uint32_t)(desc->readBytes(off, tmp, 4u * want) / 4u);
++					}
++					for (unsigned k = 0; k < kIbWords; k++) {
++						gIbWord[b][k] = tmp[k];
++					}
++				}
++			}
++		}
++	}
 +	if (method == NativeAdrenoMethodBoImport) {
 +		if (in_size != sizeof(NativeAdrenoAbiBoImport) || out_size != sizeof(NativeAdrenoAbiBoAllocReply)) {
 +			r = kIOReturnBadArgument;
@@ -2487,6 +2524,17 @@
 +				    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
 +			}
 +			IOLog("G7 GPU: IB handles next %u br %u bv %u bv2 %u\n", m[55], m[56], m[57], m[58]);
++			/* cp[4] is IB1_REM plus the dwords still waiting in the ROQ: the CP stopped near (size - cp[4]). */
++			for (unsigned b = 0; b < gIbBuffers && b < kIbKeep; b++) {
++				IOLog("G7 GPU: SUB1 buf %u/%u iova %#llx dwords %u read %u; CP at ~%u if this is IB1 (%#x%08x)\n", b,
++				    gIbBuffers, (unsigned long long)gIbIova[b], gIbDwords[b], gIbRead[b],
++				    gIbDwords[b] > cp[4] ? gIbDwords[b] - cp[4] : 0, cp[1], cp[0]);
++				for (unsigned at = 0; at < kIbWords && at < gIbRead[b]; at += 8) {
++					const volatile uint32_t *w = &gIbWord[b][at];
++					IOLog("G7 GPU: +%02u %08x %08x %08x %08x %08x %08x %08x %08x\n", at, w[0], w[1], w[2], w[3], w[4],
++					    w[5], w[6], w[7]);
++				}
++			}
 +		}
 +		const uint32_t calls = gStatCalls[NativeAdrenoMethodSubmit] + gStatCalls[NativeAdrenoMethodBoAlloc] +
 +		    gStatCalls[NativeAdrenoMethodWaitFence] + gStatOpens;
