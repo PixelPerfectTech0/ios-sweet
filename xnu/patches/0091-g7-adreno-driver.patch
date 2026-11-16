@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,882 @@
+@@ -0,0 +1,818 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -2361,70 +2361,6 @@
 +	} else if (method == kMethodSetPriority || method == kMethodNote) {
 +		r = kIOReturnSuccess;   /* one ring, no priorities; notes are not kept */
 +	} else {
-+		if (method == NativeAdrenoMethodSubmit && in_size >= 32 && gGpu->vm) {
-+			/* The first user submission's command buffers, word by word: the CP stops inside the first one with every block idle
-+			 * (diag20), and the stall snapshot cannot read it, so it is read here while the CPU's copy is current. */
-+			static volatile uint32_t dumped;
-+			const NativeAdrenoAbiSubmit *sub = reinterpret_cast<const NativeAdrenoAbiSubmit *>(in);
-+			const uint32_t nbuf = sub->buffer_count;
-+			if (dumped++ == 0 && nbuf && 32u + (size_t)nbuf * sizeof(NativeAdrenoAbiSubmitBuffer) <= in_size) {
-+				for (uint32_t b = 0; b < nbuf && b < 3; b++) {
-+					const NativeAdrenoAbiSubmitBuffer &buf = sub->buffers[b];
-+					const uint32_t words = (uint32_t)(buf.bytes / 4);
-+					IOLog("G7 GPU: SUBMIT1 buffer %u of %u: handle %llu iova %#llx dwords %u (vm handle %llu)\n", b, nbuf,
-+					    (unsigned long long)buf.handle, (unsigned long long)buf.iova, words,
-+					    (unsigned long long)gGpu->vm->handleAt(buf.iova));
-+					const uint32_t shown = words < 224 ? words : 224;
-+					/* diag22 read the IB through the descriptor (the kernel's cached view) and found 48 zero words in whole
-+					 * 64-byte lines. The GPU reads DRAM: an uncached mapping shows what it fetches. Rows are printed as the GPU
-+					 * sees them, with "C!" where the cached view differs, then the cached row. */
-+					uint64_t base = 0;
-+					size_t bytes = 0;
-+					unsigned perm = 0;
-+					NativeAdrenoMemory *mem = core_->memoryOf(buf.handle);
-+					const uint64_t vmh = gGpu->vm->handleAt(buf.iova);
-+					IOReturn dr = vmh ? gGpu->vm->describe(vmh, &base, &bytes, &perm) : kIOReturnBadArgument;
-+					IOBufferMemoryDescriptor *desc = mem ? mem->descriptor() : nullptr;
-+					IOMemoryMap *umap = nullptr;
-+					if (desc && !dr && buf.iova >= base) {
-+						umap = desc->createMappingInTask(kernel_task, 0,
-+						    kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly);
-+					}
-+					IOLog("G7 GPU: SUBMIT1 describe %#x base %#llx len %llu perm %u uncached map %p wc %u coherent %u\n", dr,
-+					    (unsigned long long)base, desc ? (unsigned long long)desc->getLength() : 0ull, perm,
-+					    umap ? (void *)umap->getVirtualAddress() : nullptr, (unsigned)native_adreno_wc_enabled,
-+					    (unsigned)native_adreno_io_coherent);
-+					uint32_t diffs = 0;
-+					for (uint32_t at = 0; umap && at < shown; at += 8) {
-+						const IOByteCount off = (IOByteCount)(buf.iova - base) + 4u * at;
-+						uint32_t w[8] = {}, c[8] = {};
-+						if (off + sizeof(w) > umap->getLength() || desc->readBytes(off, c, sizeof(c)) != sizeof(c)) {
-+							IOLog("G7 GPU: SUBMIT1 +%u out of range\n", at);
-+							break;
-+						}
-+						const volatile uint32_t *u = reinterpret_cast<const volatile uint32_t *>(umap->getVirtualAddress() + off);
-+						bool same = true;
-+						for (unsigned k = 0; k < 8; k++) {
-+							w[k] = u[k];
-+							same = same && w[k] == c[k];
-+						}
-+						IOLog("G7 GPU: +%03u %08x %08x %08x %08x %08x %08x %08x %08x%s\n", at, w[0], w[1], w[2], w[3], w[4],
-+						    w[5], w[6], w[7], same ? "" : " C!");
-+						if (!same && ++diffs <= 10) {
-+							IOLog("G7 GPU: C%03u %08x %08x %08x %08x %08x %08x %08x %08x\n", at, c[0], c[1], c[2], c[3], c[4],
-+							    c[5], c[6], c[7]);
-+						}
-+					}
-+					IOLog("G7 GPU: SUBMIT1 rows differing cached/DRAM %u; wc audit %u %u %u %u %u %u distrusted %u\n", diffs,
-+					    native_adreno_wc_audit[0], native_adreno_wc_audit[1], native_adreno_wc_audit[2],
-+					    native_adreno_wc_audit[3], native_adreno_wc_audit[4], native_adreno_wc_audit[5],
-+					    native_adreno_wc_distrusted);
-+					if (umap) {
-+						umap->release();
-+					}
-+				}
-+			}
-+		}
 +		r = core_->dispatch(method, in, in_size, out, out_size, &gGpu->clock);
 +	}
 +	IOLockUnlock(gGpu->lock);
@@ -4312,7 +4248,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/NativeAdrenoMemory.cpp
-@@ -0,0 +1,402 @@
+@@ -0,0 +1,407 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "NativeAdrenoMemory.h"
 +/* Where a call that never returns is stuck: the free/unmap/release path stores a stage number here, the board page shows it. */
@@ -4497,6 +4433,11 @@
 +        system_=true;prepared_=true;bytes_=bytes;write_combined_=write_combined;noteSystem((int64_t)bytes);
 +        status=descriptor_->getLength()==bytes?takeSegments(descriptor_,bytes,UINT64_C(1)<<bits,false):kIOReturnUnsupported;
 +        /* Default-attribute pages may still hold the zero fill in this CPU's cache: written back before the GPU reads them. */
++        /* G7: the pages themselves become write-combined (the pmap cleans and invalidates them on the change). */
++        if(status==kIOReturnSuccess && write_combined) {
++            status=NativeAdrenoSetPagesCacheMode(spans_,span_count_,true);
++            if(status==kIOReturnSuccess)system_wc_pages_=true;
++        }
 +        if(status==kIOReturnSuccess && !write_combined && !cleaned) {
 +            status=maintainImported(0,bytes,NativeAdrenoClean);
 +            NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
@@ -4613,12 +4554,12 @@
 +    native_adreno_trace_stage=30;
 +    if(device_references_ || quarantined_)return kIOReturnBusy;
 +    /* System memory's pages go back to the VM with the default attribute (vm_object_reap), as they came. */
-+    if(system_)write_combined_=false;
++    if(system_ && !system_wc_pages_)write_combined_=false;
 +    if(write_combined_) {
 +        /* The pages go back to the VM cacheable, as they came. */
 +        const IOReturn status=NativeAdrenoSetPagesCacheMode(spans_,span_count_,false);
 +        if(status) {quarantined_=true;return status;}
-+        write_combined_=false;
++        write_combined_=false;system_wc_pages_=false;
 +    }
 +    if(imported_) {
 +        if(prepared_) {
@@ -4717,7 +4658,7 @@
 +}
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/NativeAdrenoMemory.h
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,136 @@
 +/* SPDX-License-Identifier: MIT */
 +#ifndef NATIVE_ADRENO_MEMORY_H
 +#define NATIVE_ADRENO_MEMORY_H
@@ -4771,6 +4712,7 @@
 +    size_t bytes_=0,span_count_=0,span_capacity_=0;
 +    uint32_t device_references_=0;
 +    bool prepared_=false,quarantined_=false,write_combined_=false,system_=false,borrowed_=false,owned_=false;
++    bool system_wc_pages_=false;   /* G7: a system BO whose pages carry the write-combined attribute */
 +    IOReturn takeSegments(IOBufferMemoryDescriptor *,size_t bytes,uint64_t limit,bool contiguous);
 +    IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
 +public:
