@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,920 @@
+@@ -0,0 +1,946 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1873,6 +1873,12 @@
 +#include "NativeAdrenoTimer.h"
 +#include "NativeAdrenoStatus.h"
 +#include "AdrenoPM4.h"
++
++/* diag27: where the client's own view of a BO points (osfmk). */
++struct pmap;
++extern "C" unsigned int pmap_find_phys(struct pmap *, unsigned long long);
++extern "C" struct pmap *get_task_pmap(task_t);
++extern "C" int copyin(const unsigned long long uaddr, void *kaddr, size_t len);
 +
 +extern "C" {
 +uint32_t g7_gpu_rd(uint32_t dword);
@@ -2418,6 +2424,26 @@
 +				IOLog("G7 GPU: SUB1 IB%u before flush %08x %08x %08x %08x, after %08x %08x %08x %08x; flushed %llu KiB in %llu us\n",
 +				    b, gIbPreWord[b][0], gIbPreWord[b][1], gIbPreWord[b][2], gIbPreWord[b][3], gIbWord[b][0], gIbWord[b][1],
 +				    gIbWord[b][2], gIbWord[b][3], (unsigned long long)(gFlushBytes / 1024u), (unsigned long long)gFlushUs);
++				/* diag26: the words were zero after the flush too, so the client's writes are not in these pages at all. The
++				 * caller's own view (an existing mapping only: kIOMapReference makes none and changes no attribute), read with
++				 * copyin in its own context, and the physical page behind it against the descriptor's. */
++				IOMemoryMap *um = desc[b]->createMappingInTask(task_, 0, kIOMapAnywhere | kIOMapReference);
++				const uint64_t dpa = (uint64_t)desc[b]->getPhysicalSegment(off[b], nullptr, kIOMemoryMapperNone);
++				if (um) {
++					const uint64_t uva = um->getAddress() + off[b];
++					uint32_t uw[8] = {};
++					const int ce = copyin(uva, uw, sizeof(uw));
++					const uint64_t upn = pmap_find_phys(get_task_pmap(task_), uva);
++					IOLog("G7 GPU: SUB1 IB%u user view %#llx (map %#llx opts %#x len %llu): copyin %d %08x %08x %08x %08x %08x %08x; "
++					    "user pa %#llx, gpu/desc pa %#llx%s\n", b, (unsigned long long)uva, (unsigned long long)um->getAddress(),
++					    (unsigned)um->getMapOptions(), (unsigned long long)um->getLength(), ce, uw[0], uw[1], uw[2], uw[3], uw[4],
++					    uw[5], (unsigned long long)(upn << 12) | (uva & 0xfffu), (unsigned long long)dpa,
++					    (upn << 12 | (uva & 0xfffu)) == dpa ? " SAME" : " DIFFERENT");
++					um->release();
++				} else {
++					IOLog("G7 GPU: SUB1 IB%u: the caller has no mapping of this BO's descriptor (desc pa %#llx, %llu bytes)\n", b,
++					    (unsigned long long)dpa, (unsigned long long)desc[b]->getLength());
++				}
 +			}
 +		}
 +	}
