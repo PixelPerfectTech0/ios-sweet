@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,946 @@
+@@ -0,0 +1,945 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1878,7 +1878,6 @@
 +struct pmap;
 +extern "C" unsigned int pmap_find_phys(struct pmap *, unsigned long long);
 +extern "C" struct pmap *get_task_pmap(task_t);
-+extern "C" int copyin(const unsigned long long uaddr, void *kaddr, size_t len);
 +
 +extern "C" {
 +uint32_t g7_gpu_rd(uint32_t dword);
