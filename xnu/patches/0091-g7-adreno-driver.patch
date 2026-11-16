@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,945 @@
+@@ -0,0 +1,1000 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -2433,11 +2433,44 @@
 +					uint32_t uw[8] = {};
 +					const int ce = copyin(uva, uw, sizeof(uw));
 +					const uint64_t upn = pmap_find_phys(get_task_pmap(task_), uva);
-+					IOLog("G7 GPU: SUB1 IB%u user view %#llx (map %#llx opts %#x len %llu): copyin %d %08x %08x %08x %08x %08x %08x; "
-+					    "user pa %#llx, gpu/desc pa %#llx%s\n", b, (unsigned long long)uva, (unsigned long long)um->getAddress(),
-+					    (unsigned)um->getMapOptions(), (unsigned long long)um->getLength(), ce, uw[0], uw[1], uw[2], uw[3], uw[4],
-+					    uw[5], (unsigned long long)(upn << 12) | (uva & 0xfffu), (unsigned long long)dpa,
-+					    (upn << 12 | (uva & 0xfffu)) == dpa ? " SAME" : " DIFFERENT");
++					const uint64_t upa = (upn << PAGE_SHIFT) | (uva & PAGE_MASK);
++					IOLog("G7 GPU: SUB1 IB%u user view %#llx (map %#llx opts %#x len %llu): copyin %d %08x %08x %08x %08x; "
++					    "user pa %#llx, gpu/desc pa %#llx%s; off %#llx\n", b, (unsigned long long)uva,
++					    (unsigned long long)um->getAddress(), (unsigned)um->getMapOptions(), (unsigned long long)um->getLength(), ce,
++					    uw[0], uw[1], uw[2], uw[3], (unsigned long long)upa, (unsigned long long)dpa, upa == dpa ? " SAME" : " DIFFERENT",
++					    (unsigned long long)off[b]);
++					/* diag28: is anything written anywhere in this BO? Every dword of the caller's view and of the descriptor. */
++					const uint64_t span = um->getLength() < 0x10000u ? um->getLength() : 0x10000u;
++					uint32_t nz_u = 0, nz_d = 0, first_u = ~0u, first_d = ~0u, fw[4] = {};
++					for (uint64_t at = 0; at < span; at += 256) {
++						uint32_t chunk[64] = {}, dchunk[64] = {};
++						if (!copyin(um->getAddress() + at, chunk, sizeof(chunk))) {
++							for (unsigned k = 0; k < 64; k++) {
++								if (chunk[k]) {
++									if (first_u == ~0u) {
++										first_u = (uint32_t)(at / 4 + k);
++										for (unsigned q = 0; q < 4 && k + q < 64; q++) {
++											fw[q] = chunk[k + q];
++										}
++									}
++									nz_u++;
++								}
++							}
++						}
++						if (desc[b]->readBytes(at, dchunk, sizeof(dchunk)) == sizeof(dchunk)) {
++							for (unsigned k = 0; k < 64; k++) {
++								if (dchunk[k]) {
++									if (first_d == ~0u) {
++										first_d = (uint32_t)(at / 4 + k);
++									}
++									nz_d++;
++								}
++							}
++						}
++					}
++					IOLog("G7 GPU: SUB1 IB%u whole BO (%llu bytes): user view %u nonzero dwords, first at dword %d (%08x %08x %08x %08x); "
++					    "descriptor %u nonzero, first at %d\n", b, (unsigned long long)span, nz_u, (int)first_u, fw[0], fw[1], fw[2],
++					    fw[3], nz_d, (int)first_d);
 +					um->release();
 +				} else {
 +					IOLog("G7 GPU: SUB1 IB%u: the caller has no mapping of this BO's descriptor (desc pa %#llx, %llu bytes)\n", b,
@@ -2461,6 +2494,20 @@
 +	IOLockUnlock(gGpu->lock);
 +	if (method < 20) {
 +		gStatCalls[method]++;
++	}
++	/* diag28: the BO calls' arguments (alloc, GPU map, CPU map), as raw words. */
++	if ((method == NativeAdrenoMethodBoAlloc || method == NativeAdrenoMethodBoMap || method == NativeAdrenoMethodBoCpuMap) && in) {
++		static volatile uint32_t arg_lines;
++		if (++arg_lines <= 30) {
++			uint64_t a[4] = {}, o[2] = {};
++			memcpy(a, in, in_size < sizeof(a) ? in_size : sizeof(a));
++			if (out) {
++				memcpy(o, out, out_size < sizeof(o) ? out_size : sizeof(o));
++			}
++			IOLog("G7 GPU: args m%u in %llx %llx %llx %llx out %llx %llx -> %#x\n", method, (unsigned long long)a[0],
++			    (unsigned long long)a[1], (unsigned long long)a[2], (unsigned long long)a[3], (unsigned long long)o[0],
++			    (unsigned long long)o[1], r);
++		}
 +	}
 +	if (r != kIOReturnSuccess) {
 +		uint32_t e = ++gStatErrors;
@@ -2500,6 +2547,14 @@
 +		*options = m->writeCombined() ? kIOMapWriteCombineCache : 0;
 +	}
 +	IOLockUnlock(gGpu->lock);
++	static volatile uint32_t lines;
++	if (++lines <= 24) {
++		char who[24];
++		g7_stat_who(who, sizeof(who));
++		IOLog("G7 GPU: %s maps token %#x: bo %llu bytes, descriptor %llu bytes, system %d wc %d, pa %#llx\n", who, (unsigned)type,
++		    m ? (unsigned long long)m->bytes() : 0ull, d ? (unsigned long long)d->getLength() : 0ull, m ? (int)m->system() : -1,
++		    m ? (int)m->writeCombined() : -1, d ? (unsigned long long)d->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone) : 0ull);
++	}
 +	return d ? kIOReturnSuccess : kIOReturnBadArgument;
 +}
 +
