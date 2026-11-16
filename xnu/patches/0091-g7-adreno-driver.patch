@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,816 @@
+@@ -0,0 +1,866 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -2359,6 +2359,56 @@
 +	} else if (method == kMethodSetPriority || method == kMethodNote) {
 +		r = kIOReturnSuccess;   /* one ring, no priorities; notes are not kept */
 +	} else {
++		if (method == NativeAdrenoMethodSubmit && in_size >= 32 && gGpu->vm) {
++			/* The first user submission's command buffers, word by word: the CP stops inside the first one with every block idle
++			 * (diag20), and the stall snapshot cannot read it, so it is read here while the CPU's copy is current. */
++			static volatile uint32_t dumped;
++			const NativeAdrenoAbiSubmit *sub = reinterpret_cast<const NativeAdrenoAbiSubmit *>(in);
++			const uint32_t nbuf = sub->buffer_count;
++			if (dumped++ == 0 && nbuf && 32u + (size_t)nbuf * sizeof(NativeAdrenoAbiSubmitBuffer) <= in_size) {
++				for (uint32_t b = 0; b < nbuf && b < 3; b++) {
++					const NativeAdrenoAbiSubmitBuffer &buf = sub->buffers[b];
++					const uint32_t words = (uint32_t)(buf.bytes / 4);
++					IOLog("G7 GPU: SUBMIT1 buffer %u of %u: handle %llu iova %#llx dwords %u (vm handle %llu)\n", b, nbuf,
++					    (unsigned long long)buf.handle, (unsigned long long)buf.iova, words,
++					    (unsigned long long)gGpu->vm->handleAt(buf.iova));
++					const uint32_t shown = words < 224 ? words : 224;
++					for (uint32_t at = 0; at < shown; at += 8) {
++						uint32_t w[8] = {};
++						IOReturn pr = gGpu->vm->peekWordsUncached(buf.iova + 4ull * at, w, 8);
++						if (pr) {
++							pr = gGpu->vm->peekWords(buf.iova + 4ull * at, w, 8);
++						}
++						if (pr) {
++							/* The BO's own kernel mapping: offset of the IB in its GPU mapping. */
++							uint64_t base = 0;
++							size_t bytes = 0;
++							unsigned perm = 0;
++							NativeAdrenoMemory *mem = core_->memoryOf(buf.handle);
++							const uint64_t vmh = gGpu->vm->handleAt(buf.iova);
++							if (mem && mem->mapping() && vmh && !gGpu->vm->describe(vmh, &base, &bytes, &perm) &&
++							    buf.iova >= base && buf.iova + 4ull * at + 32 - base <= mem->bytes()) {
++								const volatile uint32_t *p = reinterpret_cast<const volatile uint32_t *>(
++									static_cast<const uint8_t *>(mem->mapping()) + (buf.iova - base) + 4ull * at);
++								for (unsigned k = 0; k < 8; k++) {
++									w[k] = p[k];
++								}
++								pr = kIOReturnSuccess;
++							} else if (at == 0) {
++								IOLog("G7 GPU: SUBMIT1 mem %p map %p vmh %llu base %#llx\n", mem,
++								    mem ? mem->mapping() : nullptr, (unsigned long long)vmh, (unsigned long long)base);
++							}
++						}
++						if (pr) {
++							IOLog("G7 GPU: SUBMIT1 +%u unreadable %#x\n", at, pr);
++							break;
++						}
++						IOLog("G7 GPU: +%03u %08x %08x %08x %08x %08x %08x %08x %08x\n", at, w[0], w[1], w[2], w[3], w[4],
++						    w[5], w[6], w[7]);
++					}
++				}
++			}
++		}
 +		r = core_->dispatch(method, in, in_size, out, out_size, &gGpu->clock);
 +	}
 +	IOLockUnlock(gGpu->lock);
