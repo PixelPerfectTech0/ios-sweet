@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,1074 @@
+@@ -0,0 +1,1104 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1968,6 +1968,11 @@
 +	unsigned ias = 0, oas = 40;
 +	IOLock *lock = nullptr;
 +	uint32_t slots_used = 0;        /* bit n: client window n taken */
++	/* diag30: the task that last held each window. Turnip reads its window on an enumeration connection, closes it, opens
++	 * the device connection and keeps the first window's addresses (turnip-darwin-kmd: va_start from the probe); when
++	 * another process took that slot in between, every BoMap fell outside the new window (diag29: SpringBoard m3
++	 * 0xe00002c2, VK_ERROR_OUT_OF_DEVICE_MEMORY). A task now gets its own last window back, and others avoid it. */
++	task_t slot_owner[kMaxClients] = {};
 +	bool ready = false;
 +};
 +G7Gpu *gGpu;
@@ -2190,6 +2195,9 @@
 +	NativeAdrenoUserClient *core_ = nullptr;
 +	task_t task_ = nullptr;
 +	unsigned slot_ = 0;
++public:
++	unsigned slot() const { return slot_; }
++private:
 +	bool open_ = false;
 +public:
 +	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
@@ -2247,7 +2255,7 @@
 +	uint32_t opens = ++gStatOpens;
 +	if (gStatLogged < 400) {
 +		gStatLogged++;
-+		IOLog("G7 GPU: %s[%d] opened the GPU (client %u)\n", who, proc_selfpid(), opens);
++		IOLog("G7 GPU: %s[%d] opened the GPU (client %u, window %u)\n", who, proc_selfpid(), opens, client->slot());
 +	}
 +	*handler = client;
 +	return kIOReturnSuccess;
@@ -2273,9 +2281,19 @@
 +	if (windows > kMaxClients) {
 +		windows = kMaxClients;
 +	}
-+	unsigned slot = 0;
-+	while (slot < windows && (gGpu->slots_used & (1u << slot))) {
-+		slot++;
++	/* Own last window first, then one no task has held, then any free one. */
++	unsigned slot = windows;
++	for (unsigned pass = 0; pass < 3 && slot == windows; pass++) {
++		for (unsigned s = 0; s < windows; s++) {
++			if (gGpu->slots_used & (1u << s)) {
++				continue;
++			}
++			const task_t owner = gGpu->slot_owner[s];
++			if ((pass == 0 && owner == task_) || (pass == 1 && owner == nullptr) || pass == 2) {
++				slot = s;
++				break;
++			}
++		}
 +	}
 +	bool ok = slot < windows;
 +	if (ok) {
@@ -2292,6 +2310,7 @@
 +		(void)core_->attachDeviceInfo(&gGpu->info);
 +		core_->setStatsSlot(slot < 4 ? slot : 4);
 +		gGpu->slots_used |= 1u << slot;
++		gGpu->slot_owner[slot] = task_;
 +		slot_ = slot;
 +		open_ = true;
 +	} else if (core_) {
@@ -2571,6 +2590,17 @@
 +			gStatLogged++;
 +			g7_stat_who(who, sizeof(who));
 +			IOLog("G7 GPU: %s method %u FAILED %#x (in %zu out %zu)\n", who, method, r, in_size, out_size);
++			/* diag30: a refused GPU map, against this connection's window. */
++			if (method == NativeAdrenoMethodBoMap && in && in_size >= 16) {
++				NativeAdrenoAbiDeviceInfo di{};
++				IOLockLock(gGpu->lock);
++				(void)core_->deviceInfo(&di);
++				IOLockUnlock(gGpu->lock);
++				const uint64_t *a = reinterpret_cast<const uint64_t *>(in);
++				IOLog("G7 GPU: %s map refused: handle %#llx iova %#llx, window %u = %#llx + %#llx\n", who,
++				    (unsigned long long)a[0], (unsigned long long)a[1], slot_, (unsigned long long)di.va_start,
++				    (unsigned long long)di.va_size);
++			}
 +		}
 +	}
 +	if (method == NativeAdrenoMethodSubmit && r == kIOReturnSuccess) {
