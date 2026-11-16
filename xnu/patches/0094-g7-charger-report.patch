@@ -12,7 +12,7 @@
  	}
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
-@@ -210,6 +210,42 @@ SweetBattery::estimatePercent(unsigned mv)
+@@ -210,6 +210,40 @@ SweetBattery::estimatePercent(unsigned mv)
  	return 100;
  }
  
@@ -44,18 +44,16 @@
 +			v[i] = 0xee;
 +		}
 +	}
-+	IOLog("SWEET CHG: chgr st %02x %02x %02x %02x %02x rt %02x en %02x cfg2 %02x fcc %02x fv %02x | bat rt %02x
-+",
++	IOLog("SWEET CHG: chgr st %02x %02x %02x %02x %02x rt %02x en %02x cfg2 %02x fcc %02x fv %02x | bat rt %02x\n",
 +	    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10]);
-+	IOLog("SWEET CHG: usb apsd %02x %02x rt %02x il %02x iclopt %02x icl %02x | misc icl %02x aicl %02x path %02x rt %02x wd %02x %02x
-+",
++	IOLog("SWEET CHG: usb apsd %02x %02x rt %02x il %02x iclopt %02x icl %02x | misc icl %02x aicl %02x path %02x rt %02x wd %02x %02x\n",
 +	    v[11], v[12], v[13], v[14], v[15], v[16], v[17], v[18], v[19], v[20], v[21], v[22]);
 +}
 +
  /* G7 (sweetbattery=2): PMI8998 on SPMI SID 2. Returns false if unreadable. */
  bool
  SweetBattery::pollG7(void)
-@@ -224,6 +260,7 @@ SweetBattery::pollG7(void)
+@@ -224,6 +258,7 @@ SweetBattery::pollG7(void)
  		}
  		return false;   /* unreadable, torn or not yet valid: keep the last value */
  	}
