@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,1000 @@
+@@ -0,0 +1,1074 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1980,6 +1980,52 @@
 +volatile uint32_t gIbSaved, gIbBuffers, gIbDwords[kIbKeep], gIbRead[kIbKeep], gIbWord[kIbKeep][kIbWords];
 +volatile uint64_t gIbIova[kIbKeep];
 +volatile uint32_t gIbPre[kIbKeep], gIbPreWord[kIbKeep][16];
++/* diag29: which 64-byte lines of each first-submission IB are all zero: in the caller's own view at submit (copyin), in the
++ * descriptor at submit, and in DRAM at hang time (cache lines invalidated first). The descriptor is kept for the hang read. */
++volatile uint64_t gIbZeroUser[kIbKeep], gIbZeroDesc[kIbKeep];
++IOBufferMemoryDescriptor *gIbDesc[kIbKeep];
++IOByteCount gIbOff[kIbKeep];
++static const bool kSubmitFlush = false;   /* diag29: system BOs are cleaned+invalidated once, at allocation, instead */
++extern "C" void invalidate_dcache64(addr64_t addr, unsigned count, int phys);
++static uint64_t
++g7_zero_lines_user(uint64_t uva, uint32_t dwords)
++{
++	uint64_t mask = 0;
++	for (uint32_t line = 0; line < 64 && line * 16u < dwords; line++) {
++		uint32_t w[16] = {};
++		const uint32_t n = dwords - line * 16u < 16u ? dwords - line * 16u : 16u;
++		if (copyin(uva + line * 64u, w, 4u * n)) {
++			continue;
++		}
++		bool zero = true;
++		for (uint32_t k = 0; k < n; k++) {
++			zero = zero && !w[k];
++		}
++		mask |= zero ? 1ull << line : 0;
++	}
++	return mask;
++}
++static uint64_t
++g7_zero_lines_desc(IOMemoryDescriptor *d, IOByteCount off, uint32_t dwords, uint32_t *rows)
++{
++	uint64_t mask = 0;
++	for (uint32_t line = 0; line < 64 && line * 16u < dwords; line++) {
++		uint32_t w[16] = {};
++		const uint32_t n = dwords - line * 16u < 16u ? dwords - line * 16u : 16u;
++		if (d->readBytes(off + line * 64u, w, 4u * n) != 4u * n) {
++			continue;
++		}
++		bool zero = true;
++		for (uint32_t k = 0; k < n; k++) {
++			zero = zero && !w[k];
++			if (rows && line >= 2 && line < 4) {
++				rows[(line - 2) * 16 + k] = w[k];
++			}
++		}
++		mask |= zero ? 1ull << line : 0;
++	}
++	return mask;
++}
 +/* Submission-time cache maintenance (diag26): passes, bytes and time of the last pass, slowest pass. */
 +volatile uint64_t gFlushCount, gFlushBytes, gFlushUs, gFlushMaxUs;
 +extern "C" volatile uint32_t native_adreno_stall[2 + NativeAdrenoRingStallWords], native_adreno_stall_mem[4 + 3 * 17 + 4];
@@ -2401,7 +2447,7 @@
 +				}
 +			}
 +		}
-+		if (gGpu->vm) {
++		if (kSubmitFlush && gGpu->vm) {
 +			uint64_t flushed = 0;
 +			const uint64_t t0 = now_us(nullptr);
 +			(void)gGpu->vm->flushSystemLines(&flushed);
@@ -2471,6 +2517,15 @@
 +					IOLog("G7 GPU: SUB1 IB%u whole BO (%llu bytes): user view %u nonzero dwords, first at dword %d (%08x %08x %08x %08x); "
 +					    "descriptor %u nonzero, first at %d\n", b, (unsigned long long)span, nz_u, (int)first_u, fw[0], fw[1], fw[2],
 +					    fw[3], nz_d, (int)first_d);
++					/* diag29: the zero 64-byte lines of the IB itself, in the caller's view and in the descriptor, at submit. */
++					gIbZeroUser[b] = g7_zero_lines_user(uva, gIbDwords[b]);
++					gIbZeroDesc[b] = g7_zero_lines_desc(desc[b], off[b], gIbDwords[b], nullptr);
++					desc[b]->retain();
++					gIbDesc[b] = desc[b];
++					gIbOff[b] = off[b];
++					IOLog("G7 GPU: SUB1 IB%u zero lines at submit (bit n = bytes 64n..64n+63 of the IB, %u dwords): user view %#llx, "
++					    "descriptor %#llx\n", b, gIbDwords[b], (unsigned long long)gIbZeroUser[b],
++					    (unsigned long long)gIbZeroDesc[b]);
 +					um->release();
 +				} else {
 +					IOLog("G7 GPU: SUB1 IB%u: the caller has no mapping of this BO's descriptor (desc pa %#llx, %llu bytes)\n", b,
@@ -2651,6 +2706,25 @@
 +					const volatile uint32_t *w = &gIbWord[b][at];
 +					IOLog("G7 GPU: +%02u %08x %08x %08x %08x %08x %08x %08x %08x\n", at, w[0], w[1], w[2], w[3], w[4],
 +					    w[5], w[6], w[7]);
++				}
++				/* diag29: DRAM now (CPU lines for the IB invalidated first, so this is what the GPU fetches). */
++				if (gIbDesc[b]) {
++					IOByteCount seg = 0;
++					const uint64_t pa = (uint64_t)gIbDesc[b]->getPhysicalSegment(gIbOff[b], &seg, kIOMemoryMapperNone);
++					const uint64_t want = 4ull * gIbDwords[b] + 64u;
++					if (pa && seg) {
++						const uint64_t a = pa & ~63ull;
++						invalidate_dcache64((addr64_t)a, (unsigned)((seg < want ? seg : want) + (pa - a)), 1);
++					}
++					uint32_t rows[32] = {};
++					const uint64_t zh = g7_zero_lines_desc(gIbDesc[b], gIbOff[b], gIbDwords[b], rows);
++					IOLog("G7 GPU: SUB1 IB%u zero lines: user view at submit %#llx, descriptor at submit %#llx, DRAM at hang %#llx "
++					    "(pa %#llx)\n", b, (unsigned long long)gIbZeroUser[b], (unsigned long long)gIbZeroDesc[b],
++					    (unsigned long long)zh, (unsigned long long)pa);
++					for (unsigned at = 0; at < 32; at += 8) {
++						IOLog("G7 GPU: hang+%02u %08x %08x %08x %08x %08x %08x %08x %08x\n", 32 + at, rows[at], rows[at + 1],
++						    rows[at + 2], rows[at + 3], rows[at + 4], rows[at + 5], rows[at + 6], rows[at + 7]);
++					}
 +				}
 +			}
 +		}
@@ -4430,7 +4504,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/NativeAdrenoMemory.cpp
-@@ -0,0 +1,407 @@
+@@ -0,0 +1,408 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "NativeAdrenoMemory.h"
 +/* Where a call that never returns is stuck: the free/unmap/release path stores a stage number here, the board page shows it. */
@@ -4619,6 +4693,7 @@
 +        if(status==kIOReturnSuccess && write_combined) {
 +            status=NativeAdrenoSetPagesCacheMode(spans_,span_count_,true);
 +            if(status==kIOReturnSuccess)system_wc_pages_=true;
++            if(status==kIOReturnSuccess)for(size_t i=0;spans_ && i<span_count_;++i)g7_flush_phys(spans_[i].physical,spans_[i].bytes);
 +        }
 +        if(status==kIOReturnSuccess && !write_combined && !cleaned) {
 +            status=maintainImported(0,bytes,NativeAdrenoClean);
