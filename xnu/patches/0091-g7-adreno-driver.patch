@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,867 @@
+@@ -0,0 +1,882 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1971,6 +1971,8 @@
 + * that does not answer leaves bit 30 set, and the watchdog names the register. */
 +volatile uint32_t gRegLast, gRegCount;
 +extern "C" volatile uint32_t native_adreno_stall[2 + NativeAdrenoRingStallWords], native_adreno_stall_mem[4 + 3 * 17 + 4];
++extern "C" volatile uint32_t native_adreno_wc_enabled, native_adreno_io_coherent, native_adreno_wc_audit[6],
++    native_adreno_wc_distrusted;
 +
 +int
 +rd32(void *, uint32_t reg, uint32_t *v)
@@ -2373,39 +2375,52 @@
 +					    (unsigned long long)buf.handle, (unsigned long long)buf.iova, words,
 +					    (unsigned long long)gGpu->vm->handleAt(buf.iova));
 +					const uint32_t shown = words < 224 ? words : 224;
-+					for (uint32_t at = 0; at < shown; at += 8) {
-+						uint32_t w[8] = {};
-+						IOReturn pr = gGpu->vm->peekWordsUncached(buf.iova + 4ull * at, w, 8);
-+						if (pr) {
-+							pr = gGpu->vm->peekWords(buf.iova + 4ull * at, w, 8);
-+						}
-+						if (pr) {
-+							/* The BO's own kernel mapping: offset of the IB in its GPU mapping. */
-+							uint64_t base = 0;
-+							size_t bytes = 0;
-+							unsigned perm = 0;
-+							NativeAdrenoMemory *mem = core_->memoryOf(buf.handle);
-+							const uint64_t vmh = gGpu->vm->handleAt(buf.iova);
-+							/* diag21: the IB's BO has no kernel mapping (map 0), so read it through its descriptor. */
-+							IOReturn dr = vmh ? gGpu->vm->describe(vmh, &base, &bytes, &perm) : kIOReturnBadArgument;
-+							IOBufferMemoryDescriptor *desc = mem ? mem->descriptor() : nullptr;
-+							if (desc && !dr && buf.iova >= base) {
-+								const IOByteCount off = (IOByteCount)(buf.iova - base) + 4u * at;
-+								if (desc->readBytes(off, w, sizeof(w)) == sizeof(w)) {
-+									pr = kIOReturnSuccess;
-+								}
-+							}
-+							if (pr && at == 0) {
-+								IOLog("G7 GPU: SUBMIT1 mem %p desc %p describe %#x base %#llx len %llu\n", mem, desc, dr,
-+								    (unsigned long long)base, desc ? (unsigned long long)desc->getLength() : 0ull);
-+							}
-+						}
-+						if (pr) {
-+							IOLog("G7 GPU: SUBMIT1 +%u unreadable %#x\n", at, pr);
++					/* diag22 read the IB through the descriptor (the kernel's cached view) and found 48 zero words in whole
++					 * 64-byte lines. The GPU reads DRAM: an uncached mapping shows what it fetches. Rows are printed as the GPU
++					 * sees them, with "C!" where the cached view differs, then the cached row. */
++					uint64_t base = 0;
++					size_t bytes = 0;
++					unsigned perm = 0;
++					NativeAdrenoMemory *mem = core_->memoryOf(buf.handle);
++					const uint64_t vmh = gGpu->vm->handleAt(buf.iova);
++					IOReturn dr = vmh ? gGpu->vm->describe(vmh, &base, &bytes, &perm) : kIOReturnBadArgument;
++					IOBufferMemoryDescriptor *desc = mem ? mem->descriptor() : nullptr;
++					IOMemoryMap *umap = nullptr;
++					if (desc && !dr && buf.iova >= base) {
++						umap = desc->createMappingInTask(kernel_task, 0,
++						    kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly);
++					}
++					IOLog("G7 GPU: SUBMIT1 describe %#x base %#llx len %llu perm %u uncached map %p wc %u coherent %u\n", dr,
++					    (unsigned long long)base, desc ? (unsigned long long)desc->getLength() : 0ull, perm,
++					    umap ? (void *)umap->getVirtualAddress() : nullptr, (unsigned)native_adreno_wc_enabled,
++					    (unsigned)native_adreno_io_coherent);
++					uint32_t diffs = 0;
++					for (uint32_t at = 0; umap && at < shown; at += 8) {
++						const IOByteCount off = (IOByteCount)(buf.iova - base) + 4u * at;
++						uint32_t w[8] = {}, c[8] = {};
++						if (off + sizeof(w) > umap->getLength() || desc->readBytes(off, c, sizeof(c)) != sizeof(c)) {
++							IOLog("G7 GPU: SUBMIT1 +%u out of range\n", at);
 +							break;
 +						}
-+						IOLog("G7 GPU: +%03u %08x %08x %08x %08x %08x %08x %08x %08x\n", at, w[0], w[1], w[2], w[3], w[4],
-+						    w[5], w[6], w[7]);
++						const volatile uint32_t *u = reinterpret_cast<const volatile uint32_t *>(umap->getVirtualAddress() + off);
++						bool same = true;
++						for (unsigned k = 0; k < 8; k++) {
++							w[k] = u[k];
++							same = same && w[k] == c[k];
++						}
++						IOLog("G7 GPU: +%03u %08x %08x %08x %08x %08x %08x %08x %08x%s\n", at, w[0], w[1], w[2], w[3], w[4],
++						    w[5], w[6], w[7], same ? "" : " C!");
++						if (!same && ++diffs <= 10) {
++							IOLog("G7 GPU: C%03u %08x %08x %08x %08x %08x %08x %08x %08x\n", at, c[0], c[1], c[2], c[3], c[4],
++							    c[5], c[6], c[7]);
++						}
++					}
++					IOLog("G7 GPU: SUBMIT1 rows differing cached/DRAM %u; wc audit %u %u %u %u %u %u distrusted %u\n", diffs,
++					    native_adreno_wc_audit[0], native_adreno_wc_audit[1], native_adreno_wc_audit[2],
++					    native_adreno_wc_audit[3], native_adreno_wc_audit[4], native_adreno_wc_audit[5],
++					    native_adreno_wc_distrusted);
++					if (umap) {
++						umap->release();
 +					}
 +				}
 +			}
