@@ -1986,7 +1986,7 @@
 +IOBufferMemoryDescriptor *gIbDesc[kIbKeep];
 +IOByteCount gIbOff[kIbKeep];
 +static const bool kSubmitFlush = false;   /* diag29: system BOs are cleaned+invalidated once, at allocation, instead */
-+extern "C" void invalidate_dcache64(addr64_t addr, unsigned count, int phys);
++extern "C" void g7_flush_phys(uint64_t physical, uint64_t bytes);
 +static uint64_t
 +g7_zero_lines_user(uint64_t uva, uint32_t dwords)
 +{
@@ -2707,14 +2707,14 @@
 +					IOLog("G7 GPU: +%02u %08x %08x %08x %08x %08x %08x %08x %08x\n", at, w[0], w[1], w[2], w[3], w[4],
 +					    w[5], w[6], w[7]);
 +				}
-+				/* diag29: DRAM now (CPU lines for the IB invalidated first, so this is what the GPU fetches). */
++				/* diag29: DRAM now (CPU lines for the IB cleaned+invalidated first, so this is what the GPU fetches). */
 +				if (gIbDesc[b]) {
 +					IOByteCount seg = 0;
 +					const uint64_t pa = (uint64_t)gIbDesc[b]->getPhysicalSegment(gIbOff[b], &seg, kIOMemoryMapperNone);
 +					const uint64_t want = 4ull * gIbDwords[b] + 64u;
 +					if (pa && seg) {
 +						const uint64_t a = pa & ~63ull;
-+						invalidate_dcache64((addr64_t)a, (unsigned)((seg < want ? seg : want) + (pa - a)), 1);
++						g7_flush_phys(a, (seg < want ? seg : want) + (pa - a));
 +					}
 +					uint32_t rows[32] = {};
 +					const uint64_t zh = g7_zero_lines_desc(gIbDesc[b], gIbOff[b], gIbDwords[b], rows);
