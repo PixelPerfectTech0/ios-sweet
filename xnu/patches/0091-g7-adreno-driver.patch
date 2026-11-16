@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,866 @@
+@@ -0,0 +1,920 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1974,6 +1974,9 @@
 +enum : unsigned { kIbKeep = 2, kIbWords = 64 };
 +volatile uint32_t gIbSaved, gIbBuffers, gIbDwords[kIbKeep], gIbRead[kIbKeep], gIbWord[kIbKeep][kIbWords];
 +volatile uint64_t gIbIova[kIbKeep];
++volatile uint32_t gIbPre[kIbKeep], gIbPreWord[kIbKeep][16];
++/* Submission-time cache maintenance (diag26): passes, bytes and time of the last pass, slowest pass. */
++volatile uint64_t gFlushCount, gFlushBytes, gFlushUs, gFlushMaxUs;
 +extern "C" volatile uint32_t native_adreno_stall[2 + NativeAdrenoRingStallWords], native_adreno_stall_mem[4 + 3 * 17 + 4];
 +extern "C" volatile uint32_t native_adreno_wc_enabled, native_adreno_io_coherent, native_adreno_wc_audit[6],
 +    native_adreno_wc_distrusted;
@@ -2355,13 +2358,18 @@
 +		return r;
 +	}
 +	IOLockLock(gGpu->lock);
-+	if (method == NativeAdrenoMethodSubmit && in_size >= 32 && !gIbSaved) {
-+		/* diag24: the CP takes the whole first IB (rem 0) but stops about 17 dwords in with only CP_BUSY set. Keep its first
-+		 * words (read through the descriptor only: an uncached kernel map turned the user pages into device memory, diag23
-+		 * SIGBUS) to print beside the HANG line. */
++	if (method == NativeAdrenoMethodSubmit && in_size >= 32) {
++		/* diag25: the first IB's opening 64 bytes read back as zero and the CP sat at its dword 0 (rem+ROQ = all 182): a client
++		 * view kept the pages cacheable, so the command words were still in a CPU cache line. Every submission now cleans and
++		 * invalidates every mapped system BO to PoC by physical address first (g7_flush_phys). The first submission's IB is
++		 * read before (16 words) and after (64) so the log shows whether the flush is what brings the words to DRAM. */
 +		const NativeAdrenoAbiSubmit *sub = reinterpret_cast<const NativeAdrenoAbiSubmit *>(in);
 +		const uint32_t nbuf = sub->buffer_count;
-+		if (nbuf && 32u + (size_t)nbuf * sizeof(NativeAdrenoAbiSubmitBuffer) <= in_size) {
++		const bool first = !gIbSaved && nbuf && 32u + (size_t)nbuf * sizeof(NativeAdrenoAbiSubmitBuffer) <= in_size;
++		IOBufferMemoryDescriptor *desc[kIbKeep] = {};
++		IOByteCount off[kIbKeep] = {};
++		uint32_t want[kIbKeep] = {};
++		if (first) {
 +			gIbSaved = 1;
 +			gIbBuffers = nbuf;
 +			for (uint32_t b = 0; b < nbuf && b < kIbKeep; b++) {
@@ -2373,18 +2381,43 @@
 +				unsigned perm = 0;
 +				NativeAdrenoMemory *mem = core_->memoryOf(buf.handle);
 +				const uint64_t vmh = gGpu->vm ? gGpu->vm->handleAt(buf.iova) : 0;
-+				IOBufferMemoryDescriptor *desc = mem ? mem->descriptor() : nullptr;
-+				if (desc && vmh && !gGpu->vm->describe(vmh, &base, &bytes, &perm) && buf.iova >= base) {
-+					const IOByteCount off = (IOByteCount)(buf.iova - base);
-+					const uint32_t want = gIbDwords[b] < kIbWords ? gIbDwords[b] : kIbWords;
-+					uint32_t tmp[kIbWords] = {};
-+					if (off + 4u * want <= desc->getLength()) {
-+						gIbRead[b] = (uint32_t)(desc->readBytes(off, tmp, 4u * want) / 4u);
-+					}
-+					for (unsigned k = 0; k < kIbWords; k++) {
-+						gIbWord[b][k] = tmp[k];
++				IOBufferMemoryDescriptor *d = mem ? mem->descriptor() : nullptr;
++				if (d && vmh && !gGpu->vm->describe(vmh, &base, &bytes, &perm) && buf.iova >= base) {
++					off[b] = (IOByteCount)(buf.iova - base);
++					want[b] = gIbDwords[b] < kIbWords ? gIbDwords[b] : kIbWords;
++					if (off[b] + 4u * want[b] <= d->getLength()) {
++						desc[b] = d;
++						uint32_t tmp[16] = {};
++						gIbPre[b] = (uint32_t)(d->readBytes(off[b], tmp, 4u * (want[b] < 16 ? want[b] : 16)) / 4u);
++						for (unsigned k = 0; k < 16; k++) {
++							gIbPreWord[b][k] = tmp[k];
++						}
 +					}
 +				}
++			}
++		}
++		if (gGpu->vm) {
++			uint64_t flushed = 0;
++			const uint64_t t0 = now_us(nullptr);
++			(void)gGpu->vm->flushSystemLines(&flushed);
++			const uint64_t us = now_us(nullptr) - t0;
++			gFlushCount++;
++			gFlushBytes = flushed;
++			gFlushUs = us;
++			if (us > gFlushMaxUs) {
++				gFlushMaxUs = us;
++			}
++		}
++		for (uint32_t b = 0; first && b < nbuf && b < kIbKeep; b++) {
++			if (desc[b]) {
++				uint32_t tmp[kIbWords] = {};
++				gIbRead[b] = (uint32_t)(desc[b]->readBytes(off[b], tmp, 4u * want[b]) / 4u);
++				for (unsigned k = 0; k < kIbWords; k++) {
++					gIbWord[b][k] = tmp[k];
++				}
++				IOLog("G7 GPU: SUB1 IB%u before flush %08x %08x %08x %08x, after %08x %08x %08x %08x; flushed %llu KiB in %llu us\n",
++				    b, gIbPreWord[b][0], gIbPreWord[b][1], gIbPreWord[b][2], gIbPreWord[b][3], gIbWord[b][0], gIbWord[b][1],
++				    gIbWord[b][2], gIbWord[b][3], (unsigned long long)(gFlushBytes / 1024u), (unsigned long long)gFlushUs);
 +			}
 +		}
 +	}
@@ -2529,6 +2562,11 @@
 +				IOLog("G7 GPU: SUB1 buf %u/%u iova %#llx dwords %u read %u; CP at ~%u if this is IB1 (%#x%08x)\n", b,
 +				    gIbBuffers, (unsigned long long)gIbIova[b], gIbDwords[b], gIbRead[b],
 +				    gIbDwords[b] > cp[4] ? gIbDwords[b] - cp[4] : 0, cp[1], cp[0]);
++				for (unsigned at = 0; at < 16 && at < gIbPre[b]; at += 8) {
++					const volatile uint32_t *w = &gIbPreWord[b][at];
++					IOLog("G7 GPU: pre+%02u %08x %08x %08x %08x %08x %08x %08x %08x (before the flush)\n", at, w[0], w[1], w[2],
++					    w[3], w[4], w[5], w[6], w[7]);
++				}
 +				for (unsigned at = 0; at < kIbWords && at < gIbRead[b]; at += 8) {
 +					const volatile uint32_t *w = &gIbWord[b][at];
 +					IOLog("G7 GPU: +%02u %08x %08x %08x %08x %08x %08x %08x %08x\n", at, w[0], w[1], w[2], w[3], w[4],
@@ -2541,10 +2579,12 @@
 +		if (++ticks % 10 == 0 && (done != last_done || sub != last_sub || calls != last_calls) && gStatLogged < 400) {
 +			gStatLogged++;
 +			IOLog("G7 GPU: live: opens %u, fence %u of %u, submits %u allocs %u maps %u cpumaps %u waits %u errors %u%s, "
-+			    "smmu fault %#x far %#x%08x\n", gStatOpens, done, sub, gStatCalls[NativeAdrenoMethodSubmit],
++			    "smmu fault %#x far %#x%08x; flush %llu x, last %llu KiB %llu us, max %llu us\n", gStatOpens, done, sub,
++			    gStatCalls[NativeAdrenoMethodSubmit],
 +			    gStatCalls[NativeAdrenoMethodBoAlloc], gStatCalls[NativeAdrenoMethodBoMap],
 +			    gStatCalls[NativeAdrenoMethodBoCpuMap], gStatCalls[NativeAdrenoMethodWaitFence], gStatErrors,
-+			    gHung ? ", HUNG" : "", flt[0], flt[2], flt[1]);
++			    gHung ? ", HUNG" : "", flt[0], flt[2], flt[1], (unsigned long long)gFlushCount,
++			    (unsigned long long)(gFlushBytes / 1024u), (unsigned long long)gFlushUs, (unsigned long long)gFlushMaxUs);
 +			last_done = done;
 +			last_sub = sub;
 +			last_calls = calls;
@@ -2698,6 +2738,20 @@
 +	    bank, g->ias, gAccelerator ? "published" : "MISSING (no IOResources match)");
 +	return 0;
 +#undef G7_FAIL
++}
++
++/* Clean and invalidate [physical, physical + bytes) to the point of coherency through the physical aperture (DC CIVAC by VA operates on
++ * the line of that physical address whatever the attribute of the other views). Used by NativeAdrenoMemory::flushCpuLines. */
++extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
++extern "C" void
++g7_flush_phys(uint64_t physical, uint64_t bytes)
++{
++	while (bytes) {
++		const unsigned chunk = bytes > (1u << 30) ? (1u << 30) : (unsigned)bytes;
++		flush_dcache64((addr64_t)physical, chunk, 1);
++		physical += chunk;
++		bytes -= chunk;
++	}
 +}
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/LICENSE
@@ -4706,7 +4760,7 @@
 +}
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/NativeAdrenoMemory.h
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,140 @@
 +/* SPDX-License-Identifier: MIT */
 +#ifndef NATIVE_ADRENO_MEMORY_H
 +#define NATIVE_ADRENO_MEMORY_H
@@ -4749,6 +4803,7 @@
 + * Every published mapping/job must hold a device reference BEFORE publication,
 + * and retire it only after actual DMA quiescence and completed native TLB unmap.
 + * References are lifetime accounting, never fences or proof of quiescence. */
++extern "C" void g7_flush_phys(uint64_t physical,uint64_t bytes);   /* G7Adreno.cpp: clean+invalidate to PoC by PA */
 +class NativeAdrenoMemory final {
 +    IOBufferMemoryDescriptor *descriptor_=nullptr;
 +    IOMemoryDescriptor *imported_=nullptr;
@@ -4812,6 +4867,9 @@
 +     * write-combined, so publishForDevice/acquireDeviceWrites have nothing left to do. release() restores the default attribute. */
 +    IOReturn makeWriteCombined();
 +    bool writeCombined() const {return write_combined_;}
++    /* G7: clean+invalidate every page to PoC by physical address (a CPU view that stayed cacheable). */
++    void flushCpuLines(uint64_t *bytes) const
++    {for(size_t i=0;spans_ && i<span_count_;++i) {g7_flush_phys(spans_[i].physical,spans_[i].bytes);if(bytes)*bytes+=spans_[i].bytes;}}
 +    /* NativeAdrenoReassertWriteCombined over this object's pages; nothing for an object that is not write-combined, nor for system memory:
 +     * XNU set the pages of BOs whose views mapped their physical pages back to the default attribute as it tore a device-pager view down
 +     * (int-160: 123847 pages; untagged-2319cf3e5: 685208 pages, 3.8 s of submissions), while a view of a VM object maps it with the
@@ -7673,7 +7731,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/NativeAdrenoVm.cpp
-@@ -0,0 +1,650 @@
+@@ -0,0 +1,659 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "NativeAdrenoVm.h"
 +#include "NativeAdrenoVmAlias.h"
@@ -8186,6 +8244,15 @@
 +    }
 +    return kIOReturnBadArgument;
 +}
++IOReturn NativeAdrenoVm::flushSystemLines(uint64_t *bytes) const
++{
++    if(!attached_ || poisoned_)return kIOReturnNotReady;
++    for(size_t i=0;i<high_;++i) {
++        const Mapping &m=mappings_[i];
++        if(m.memory && m.memory->system() && !m.memory->imported())m.memory->flushCpuLines(bytes);
++    }
++    return kIOReturnSuccess;
++}
 +IOReturn NativeAdrenoVm::reassertWriteCombined(uint32_t *reset) const
 +{
 +    if(!reset)return kIOReturnBadArgument;
@@ -8326,7 +8393,7 @@
 +}
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/NativeAdrenoVm.h
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,170 @@
 +/* SPDX-License-Identifier: MIT */
 +#ifndef NATIVE_ADRENO_VM_H
 +#define NATIVE_ADRENO_VM_H
@@ -8456,6 +8523,8 @@
 +    /* Before a submission while write-combined BOs are trusted: every page of every mapped write-combined BO that XNU set back to the
 +     * default attribute is write-combined again (and its lines written back); *reset counts the pages. */
 +    IOReturn reassertWriteCombined(uint32_t *reset) const;
++    /* G7: flushCpuLines over every mapped system BO (not imports: their owner maintains them). */
++    IOReturn flushSystemLines(uint64_t *bytes) const;
 +    IOReturn auditRange(uint64_t iova,size_t bytes,uint32_t *lines,uint32_t *dirty,uint32_t *stale) const;
 +    /* Read-only description of a live mapping; never pins or extends it. */
 +    IOReturn describe(uint64_t handle,uint64_t *iova,size_t *bytes,unsigned *permissions) const;
