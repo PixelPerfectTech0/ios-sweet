@@ -1,0 +1,157 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index a89579f..fd4ad33 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -1,7 +1,7 @@
+ /*
+  * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
+- * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
+- * No interrupt clear, peripheral enable, charger config, or PMIC writes.
++ * PMIC reads through the observer. One write, G7 only: the PMI8998 input
++ * current limit (sweet_spmi_write). No interrupt clear or peripheral enable.
+  * Init is serialized by the single built-in SweetBattery personality.
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+  */
+@@ -17,6 +17,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ #define SP_CORE_PA 0x0c440000u
+ #define SP_OBS_PA  0x0e600000u
+ #define SP_CFG_PA  0x0c40a000u
++#define SP_CHNLS_PA 0x0c600000u   /* owner channels: 0x10000 per APID (spmi-pmic-arb v5) */
+ #define SP_NO_APID 0xffffu
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+@@ -126,4 +127,49 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++
++/*
++ * G7: the one PMIC write this kernel makes. PMI8998 (SID 2) USBIN_CURRENT_LIMIT_CFG 0x1370, the input current limit in 25 mA
++ * steps that the charger uses in high-current mode (ICL options 0x1366 bit 0, already set by the bootloader). Anything else
++ * is refused. Owner channel EXT_WRITEL (opcode 0, one byte): WDATA0 at +0x10, command at +0x00, status at +0x08, only when
++ * this EE (0, the application processor) owns the peripheral.
++ */
++int
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value)
++{
++	static vm_offset_t chan[512];
++	if (!sp_ready || sid != 2 || addr != 0x1370u) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
++	if (apid == SP_NO_APID || apid >= 512 || sp_poisoned[apid] || (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
++		IOLockUnlock(sp_lock);
++		return -2;
++	}
++	if (!chan[apid]) {
++		chan[apid] = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++		if (!chan[apid]) {
++			IOLockUnlock(sp_lock);
++			return -3;
++		}
++	}
++	const vm_offset_t c = chan[apid];
++	*(volatile uint32_t *)(c + 0x10u) = value;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(c + 0x00u) = (0u << 27) | ((addr & 0xffu) << 4); /* EXT_WRITEL, BC=0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(c, 0x08u);
++		if (status & 1u) {
++			IOLockUnlock(sp_lock);
++			return (status & 0x0eu) ? -4 : 0;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	printf("SWEET BATTERY: SPMI write timeout sid=%u addr=%#x APID=%u disabled\n", sid, addr, apid);
++	IOLockUnlock(sp_lock);
++	return -5;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 45565d1..3708626 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,8 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* G7 only: PMI8998 0x1370 (input current limit); every other address is refused. 0 success. */
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index a54fd02..2886202 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -15,6 +15,7 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -284,6 +285,24 @@ SweetBattery::publishG7Adapter(bool external)
+ 		family = 0xe0004007u;
+ 		what = "charger (unreadable)";
+ 	}
++	/* The charger's input limit stays at the bootloader's 500 mA (0x1370 = 0x14) on every adapter, and a booting phone
++	 * draws more than that: on a wall charger the battery ran empty (diag30, LG 0%). Wall chargers, Quick Charge and a
++	 * computer's charging port (BC1.2: 1.5 A) get 1500 mA; the charger's AICL still backs off if the adapter sags. */
++	if (ok && (apsd & 0x6cu)) {
++		uint8_t cfg = 0;
++		if (!sweet_spmi_read(2, 0x1370, &cfg) && cfg < 0x3c) {
++			const int w = sweet_spmi_write(2, 0x1370, 0x3c);
++			uint8_t back = 0, now_icl = 0;
++			(void)sweet_spmi_read(2, 0x1370, &back);
++			IODelay(2000);
++			(void)sweet_spmi_read(2, 0x1607, &now_icl);
++			IOLog("SWEET CHG: input limit %u -> 1500 mA (apsd %02x): write %d, 0x1370 now %02x, charger allows %u mA\n",
++			    (unsigned)cfg * 25u, apsd, w, back, (unsigned)now_icl * 25u);
++			if (!w && now_icl) {
++				icl = now_icl;
++			}
++		}
++	}
+ 	const unsigned ma = ok ? (unsigned)icl * 25u : 0u;
+ 	unsigned watts = (ma * 5u + 500u) / 1000u;
+ 	if (external && watts == 0) {
+@@ -342,6 +361,18 @@ SweetBattery::pollG7(void)
+ 	uint8_t soc = 0, soc2 = 0, usb = 0, charger = 0;
+ 	int e1 = sweet_spmi_read(2, 0x4009, &soc), e2 = sweet_spmi_read(2, 0x4009, &soc2);
+ 	int e3 = sweet_spmi_read(2, 0x1310, &usb), e4 = sweet_spmi_read(2, 0x1006, &charger);
++	/* The gauge alone is enough for the level: a failed charger-state read (diag29: charger -1) used to drop the whole
++	 * poll, and the first poll's fallback then showed 100% on a nearly empty battery. */
++	if (!e1 && !e2 && soc == soc2 && soc != 0 && (e3 || e4)) {
++		if (fG7Failures++ < 5) {
++			IOLog("SWEET BATTERY: G7 charger read failed (usb %d charger %d), level from the gauge only\n", e3, e4);
++		}
++		if (e3) {
++			usb = 0x10;     /* unknown: report external power rather than a draining battery */
++		}
++		charger = e4 ? 3 : charger;
++		e3 = e4 = 0;
++	}
+ 	if (e1 || e2 || e3 || e4 || soc != soc2 || soc == 0) {
+ 		if (fG7Failures++ < 5) {
+ 			IOLog("SWEET BATTERY: G7 read failed: soc %d/%d (%#x/%#x) usb %d (%#x) charger %d (%#x)\n",
+@@ -376,10 +407,12 @@ void
+ SweetBattery::poll(void)
+ {
+ 	if (fG7) {
+-		if (!pollG7() && !fG7Published) {
+-			publish(100, 4200, 0, true, true, false, true, false, false);
++		if (pollG7()) {
++			fG7Published = true;
++		} else if (!fG7Published) {
++			/* Nothing read yet: an unknown level on external power, not "full". */
++			publish(50, 3800, 0, true, true, false, false, false, false);
+ 		}
+-		fG7Published = true;
+ 		return;
+ 	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
