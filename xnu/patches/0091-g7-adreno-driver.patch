@@ -1832,7 +1832,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/g7adreno/G7Adreno.cpp
-@@ -0,0 +1,1104 @@
+@@ -0,0 +1,1133 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * LG G7 ThinQ (Adreno 630): the full GPU driver for this port, glue written
@@ -1973,6 +1973,11 @@
 +	 * another process took that slot in between, every BoMap fell outside the new window (diag29: SpringBoard m3
 +	 * 0xe00002c2, VK_ERROR_OUT_OF_DEVICE_MEMORY). A task now gets its own last window back, and others avoid it. */
 +	task_t slot_owner[kMaxClients] = {};
++	/* diag32: the probe connection stays open while Turnip opens the device connection (diag31: chronod got window 5
++	 * twice, mapped at 0x50005c000 from its probe's window 4, m3 0xe00002c2). A window now belongs to a process: every
++	 * open connection of one task shares one GPU window; the queue slot stays per connection. */
++	uint8_t win_refs[kMaxClients] = {};   /* open connections using GPU window n */
++	task_t win_task[kMaxClients] = {};    /* their task while win_refs[n] > 0 */
 +	bool ready = false;
 +};
 +G7Gpu *gGpu;
@@ -2194,9 +2199,11 @@
 +	OSDeclareDefaultStructors(AGXDeviceUserClient)
 +	NativeAdrenoUserClient *core_ = nullptr;
 +	task_t task_ = nullptr;
-+	unsigned slot_ = 0;
++	unsigned slot_ = 0;     /* GPU window (shared by the task's connections) */
++	unsigned queue_ = 0;    /* queue slot (this connection's own) */
 +public:
 +	unsigned slot() const { return slot_; }
++	unsigned queue() const { return queue_; }
 +private:
 +	bool open_ = false;
 +public:
@@ -2255,7 +2262,8 @@
 +	uint32_t opens = ++gStatOpens;
 +	if (gStatLogged < 400) {
 +		gStatLogged++;
-+		IOLog("G7 GPU: %s[%d] opened the GPU (client %u, window %u)\n", who, proc_selfpid(), opens, client->slot());
++		IOLog("G7 GPU: %s[%d] opened the GPU (client %u, window %u, queue %u)\n", who, proc_selfpid(), opens, client->slot(),
++		    client->queue());
 +	}
 +	*handler = client;
 +	return kIOReturnSuccess;
@@ -2281,26 +2289,41 @@
 +	if (windows > kMaxClients) {
 +		windows = kMaxClients;
 +	}
-+	/* Own last window first, then one no task has held, then any free one. */
++	/* GPU window: the one this task has open now, else its own last one, then one no task has held, then any free. */
 +	unsigned slot = windows;
-+	for (unsigned pass = 0; pass < 3 && slot == windows; pass++) {
++	for (unsigned pass = 0; pass < 4 && slot == windows; pass++) {
 +		for (unsigned s = 0; s < windows; s++) {
-+			if (gGpu->slots_used & (1u << s)) {
-+				continue;
-+			}
++			const bool inuse = gGpu->win_refs[s] != 0;
 +			const task_t owner = gGpu->slot_owner[s];
-+			if ((pass == 0 && owner == task_) || (pass == 1 && owner == nullptr) || pass == 2) {
++			if ((pass == 0 && inuse && gGpu->win_task[s] == task_) ||
++			    (pass == 1 && !inuse && owner == task_) ||
++			    (pass == 2 && !inuse && owner == nullptr) ||
++			    (pass == 3 && !inuse)) {
 +				slot = s;
 +				break;
 +			}
 +		}
 +	}
-+	bool ok = slot < windows;
++	/* Queue slot: the window's own number when free, else any free one. */
++	unsigned queue = kMaxClients;
++	if (slot < windows) {
++		if (!(gGpu->slots_used & (1u << slot))) {
++			queue = slot;
++		} else {
++			for (unsigned q = 0; q < kMaxClients; q++) {
++				if (!(gGpu->slots_used & (1u << q))) {
++					queue = q;
++					break;
++				}
++			}
++		}
++	}
++	bool ok = slot < windows && queue < kMaxClients;
 +	if (ok) {
 +		core_ = new NativeAdrenoUserClient;
 +		ok = core_ &&
 +		    core_->open(NativeAdrenoAbiVersion, gGpu->vm, &gGpu->submit, &gGpu->ring, gGpu->ias, gGpu->oas) == kIOReturnSuccess &&
-+		    core_->setScope((uint64_t)slot * NativeAdrenoQueueRange, GpuClientVaStart + slot * kClientWindow,
++		    core_->setScope((uint64_t)queue * NativeAdrenoQueueRange, GpuClientVaStart + slot * kClientWindow,
 +		    kClientWindow) == kIOReturnSuccess;
 +	}
 +	if (ok) {
@@ -2308,10 +2331,13 @@
 +		(void)core_->attachTimer(&gGpu->timer);
 +		(void)core_->attachStatus(&gGpu->status);
 +		(void)core_->attachDeviceInfo(&gGpu->info);
-+		core_->setStatsSlot(slot < 4 ? slot : 4);
-+		gGpu->slots_used |= 1u << slot;
++		core_->setStatsSlot(queue < 4 ? queue : 4);
++		gGpu->slots_used |= 1u << queue;
++		gGpu->win_refs[slot]++;
++		gGpu->win_task[slot] = task_;
 +		gGpu->slot_owner[slot] = task_;
 +		slot_ = slot;
++		queue_ = queue;
 +		open_ = true;
 +	} else if (core_) {
 +		delete core_;
@@ -2329,7 +2355,10 @@
 +		IOLockLock(gGpu->lock);
 +		trace.r = core_->releaseAll(&gGpu->clock, kWaitUs);
 +		(void)core_->close();
-+		gGpu->slots_used &= ~(1u << slot_);
++		gGpu->slots_used &= ~(1u << queue_);
++		if (gGpu->win_refs[slot_] != 0 && --gGpu->win_refs[slot_] == 0) {
++			gGpu->win_task[slot_] = nullptr;
++		}
 +		open_ = false;
 +		IOLockUnlock(gGpu->lock);
 +	}
