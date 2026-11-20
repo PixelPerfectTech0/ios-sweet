@@ -1,0 +1,191 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index fd4ad33..eba272e 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -1,7 +1,8 @@
+ /*
+  * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
+  * PMIC reads through the observer. One write, G7 only: the PMI8998 input
+- * current limit (sweet_spmi_write). No interrupt clear or peripheral enable.
++ * current limit (sweet_spmi_write), and at halt the PM8998 PS_HOLD action
++ * (sweet_spmi_pon_shutdown). No interrupt clear or peripheral enable.
+  * Init is serialized by the single built-in SweetBattery personality.
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+  */
+@@ -134,23 +135,18 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+  * is refused. Owner channel EXT_WRITEL (opcode 0, one byte): WDATA0 at +0x10, command at +0x00, status at +0x08, only when
+  * this EE (0, the application processor) owns the peripheral.
+  */
+-int
+-sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value)
++/* Owner channel write, sp_lock held (or every other CPU stopped). 0 success. */
++static int
++sp_owner_write(unsigned sid, unsigned addr, uint8_t value)
+ {
+ 	static vm_offset_t chan[512];
+-	if (!sp_ready || sid != 2 || addr != 0x1370u) {
+-		return -1;
+-	}
+-	IOLockLock(sp_lock);
+ 	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
+ 	if (apid == SP_NO_APID || apid >= 512 || sp_poisoned[apid] || (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
+-		IOLockUnlock(sp_lock);
+ 		return -2;
+ 	}
+ 	if (!chan[apid]) {
+ 		chan[apid] = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
+ 		if (!chan[apid]) {
+-			IOLockUnlock(sp_lock);
+ 			return -3;
+ 		}
+ 	}
+@@ -162,14 +158,52 @@ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value)
+ 	for (unsigned i = 0; i < 1000; ++i) {
+ 		uint32_t status = sp_rd(c, 0x08u);
+ 		if (status & 1u) {
+-			IOLockUnlock(sp_lock);
+ 			return (status & 0x0eu) ? -4 : 0;
+ 		}
+ 		delay(1);
+ 	}
+ 	sp_poisoned[apid] = true;
+ 	printf("SWEET BATTERY: SPMI write timeout sid=%u addr=%#x APID=%u disabled\n", sid, addr, apid);
+-	IOLockUnlock(sp_lock);
+ 	return -5;
+ }
++
++int
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value)
++{
++	if (!sp_ready || sid != 2 || addr != 0x1370u) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	int r = sp_owner_write(sid, addr, value);
++	IOLockUnlock(sp_lock);
++	return r;
++}
++
++/*
++ * G7 power off. The PM8998 (SID 0) PON block decides what happens when the SoC drops PS_HOLD; left as a reset, a halted
++ * phone came straight back up into iOS. Set PS_HOLD_RESET_CTL 0x085a to 4 (SHUTDOWN), with the PS_HOLD reset disabled
++ * around the change (PS_HOLD_RESET_CTL2 0x085b bit 7), as Linux qpnp-power-on does before PSCI SYSTEM_OFF.
++ * Halt time only: the other CPUs are stopped, so a lock left held is not waited for.
++ */
++int
++sweet_spmi_pon_shutdown(void)
++{
++	if (!sp_ready) {
++		return -1;
++	}
++	bool locked = IOLockTryLock(sp_lock);
++	int r = sp_owner_write(0, 0x085bu, 0x00);
++	if (r == 0) {
++		delay(1000);
++		r = sp_owner_write(0, 0x085au, 0x04);
++	}
++	if (r == 0) {
++		delay(1000);
++		r = sp_owner_write(0, 0x085bu, 0x80);
++	}
++	if (locked) {
++		IOLockUnlock(sp_lock);
++	}
++	return r;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 3708626..1cad465 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -10,6 +10,8 @@ int sweet_spmi_init(void);
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ /* G7 only: PMI8998 0x1370 (input current limit); every other address is refused. 0 success. */
+ int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
++/* G7 halt only: PM8998 PON PS_HOLD action = shut down. 0 success. */
++int sweet_spmi_pon_shutdown(void);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 2886202..f471030 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -16,6 +16,64 @@
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern "C" int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
++extern "C" int sweet_spmi_pon_shutdown(void);
++#include <IOKit/IOPlatformExpert.h>   /* PE_halt_restart */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++/*
++ * G7 shut down and restart. Without a PE_halt_restart hook XNU printed "CPU halted" and spun, and the phone was reset
++ * from outside (watchdog) straight back into iOS. Halt: PMIC PS_HOLD action = shut down, then PSCI SYSTEM_OFF; if
++ * that returns, drop PS_HOLD. Restart: IMEM restart reason "normal" (not fastboot), then PSCI SYSTEM_RESET.
++ * Panics and other types keep the old behaviour (return -1: the panic text stays on screen).
++ */
++#define G7_IMEM_RESTART_PA   0x146aa000u   /* qcom,msm-imem; restart_reason at +0x65c */
++#define G7_PSHOLD_PA         0x0c264000u
++static vm_offset_t g7_imem, g7_pshold;
++
++static int32_t
++g7_psci(uint64_t fn)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int32_t)x0;
++}
++
++static int
++g7_halt_restart(unsigned int type)
++{
++	if (type == kPEHaltCPU) {
++		int pmic = sweet_spmi_pon_shutdown();
++		printf("SWEET POWER: power off (PMIC %d)\n", pmic);
++		if (g7_imem) {
++			*(volatile uint32_t *)(g7_imem + 0x65c) = 0;
++		}
++		__asm__ volatile("dsb sy" ::: "memory");
++		int32_t r = g7_psci(0x84000008ULL);   /* SYSTEM_OFF */
++		printf("SWEET POWER: SYSTEM_OFF returned %d, dropping PS_HOLD\n", r);
++		if (g7_pshold) {
++			*(volatile uint32_t *)g7_pshold = 0;
++		}
++		for (;;) {
++			__asm__ volatile("wfe");
++		}
++	}
++	if (type == kPERestartCPU) {
++		printf("SWEET POWER: restart\n");
++		if (g7_imem) {
++			*(volatile uint32_t *)(g7_imem + 0x65c) = 0x77665501u;   /* normal reboot */
++		}
++		__asm__ volatile("dsb sy" ::: "memory");
++		int32_t r = g7_psci(0x84000009ULL);   /* SYSTEM_RESET */
++		printf("SWEET POWER: SYSTEM_RESET returned %d\n", r);
++		return -1;
++	}
++	return -1;
++}
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -477,6 +535,12 @@ SweetBattery::start(IOService *provider)
+ 	fG7 = fReal && real == 2;
+ 	IOLog("SWEET BATTERY: sweetbattery=%d, SPMI %s, G7 mode %s\n", real,
+ 	    fReal ? "ready" : "not ready", fG7 ? "on" : "off");
++	if (fG7 && PE_halt_restart == NULL) {
++		g7_imem = ml_io_map(G7_IMEM_RESTART_PA, 0x1000);
++		g7_pshold = ml_io_map(G7_PSHOLD_PA, 0x1000);
++		PE_halt_restart = g7_halt_restart;
++		IOLog("SWEET POWER: shut down and restart hooked\n");
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
